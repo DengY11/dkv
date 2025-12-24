@@ -60,7 +60,7 @@ CrudStats BenchDKVSingle(std::size_t n) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 512 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 64 * 1024 * 1024;
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
