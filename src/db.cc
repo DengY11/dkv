@@ -14,6 +14,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <atomic>
 
 #include "block_cache.h"
 #include "memtable.h"
@@ -41,6 +42,7 @@ class DB::Impl {
   Status Compact();
   Status Scan(const ReadOptions& options, std::string_view from, std::size_t limit,
               std::vector<std::pair<std::string, std::string>>& out);
+  Metrics GetMetrics() const;
 
  private:
   struct TableRef;
@@ -72,6 +74,21 @@ class DB::Impl {
   std::condition_variable wal_sync_cv_;
   std::mutex wal_sync_mu_;
   bool stop_wal_sync_{false};
+
+  struct MetricsCounters {
+    std::atomic<std::uint64_t> puts{0};
+    std::atomic<std::uint64_t> deletes{0};
+    std::atomic<std::uint64_t> gets{0};
+    std::atomic<std::uint64_t> batches{0};
+    std::atomic<std::uint64_t> flushes{0};
+    std::atomic<std::uint64_t> flush_ms{0};
+    std::atomic<std::uint64_t> flush_bytes{0};
+    std::atomic<std::uint64_t> compactions{0};
+    std::atomic<std::uint64_t> compaction_ms{0};
+    std::atomic<std::uint64_t> compaction_input_bytes{0};
+    std::atomic<std::uint64_t> compaction_output_bytes{0};
+    std::atomic<std::uint64_t> wal_syncs{0};
+  } metrics_;
 
   struct TableRef {
     std::shared_ptr<SSTable> table;
@@ -146,6 +163,7 @@ void DB::Impl::WalSyncLoop() {
     if (wal_sync_cv_.wait_for(lk, interval, [this] { return stop_wal_sync_; })) break;
     lk.unlock();
     wal_->Sync(false);
+    metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
     lk.lock();
   }
 }
@@ -213,12 +231,14 @@ Status DB::Impl::LoadSSTables() {
 
 Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string value) {
   std::lock_guard lock(mu_);
+  metrics_.puts.fetch_add(1, std::memory_order_relaxed);
   const std::uint64_t seq = next_seq_++;
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendPut(seq, key, value, sync_now);
   if (!s.ok()) return s;
   s = mem_.Put(seq, key, value);
   if (!s.ok()) return s;
+  if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
   if (mem_.ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
     s = FlushLocked();
     if (!s.ok()) return s;
@@ -229,12 +249,14 @@ Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string v
 
 Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
   std::lock_guard lock(mu_);
+  metrics_.deletes.fetch_add(1, std::memory_order_relaxed);
   const std::uint64_t seq = next_seq_++;
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendDelete(seq, key, sync_now);
   if (!s.ok()) return s;
   s = mem_.Delete(seq, key);
   if (!s.ok()) return s;
+  if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
   if (mem_.ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
     s = FlushLocked();
     if (!s.ok()) return s;
@@ -246,6 +268,7 @@ Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
 Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
   if (batch.empty()) return Status::OK();
   std::lock_guard lock(mu_);
+  metrics_.batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<std::uint64_t> seqs;
   seqs.reserve(batch.ops().size());
 
@@ -271,6 +294,7 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
 
   const bool need_sync = options.sync || options_.sync_wal;
   if (need_sync) {
+    metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
     Status s = wal_->Sync(/*force_sync=*/true);
     if (!s.ok()) return s;
   }
@@ -284,6 +308,7 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
 }
 
 Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::string& value) {
+  metrics_.gets.fetch_add(1, std::memory_order_relaxed);
   // Check memtable first (newest).
   MemEntry entry;
   if (mem_.Get(key, entry)) {
@@ -366,6 +391,7 @@ Status DB::Impl::Flush() {
 Status DB::Impl::FlushLocked() {
   if (mem_.Empty()) return Status::OK();
 
+  auto start = std::chrono::steady_clock::now();
   auto entries = mem_.Snapshot();  // Already sorted by key.
   if (entries.empty()) return Status::OK();
 
@@ -395,7 +421,13 @@ Status DB::Impl::FlushLocked() {
                     TableRef{table, table->min_key(), table->max_key(), table->file_size()});
   std::sort(levels_[0].begin(), levels_[0].end(),
             [](const TableRef& a, const TableRef& b) { return a.table->max_sequence() > b.table->max_sequence(); });
-  return WriteManifest();
+  Status ms = WriteManifest();
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                     .count();
+  metrics_.flushes.fetch_add(1, std::memory_order_relaxed);
+  metrics_.flush_ms.fetch_add(static_cast<std::uint64_t>(elapsed), std::memory_order_relaxed);
+  metrics_.flush_bytes.fetch_add(table->file_size(), std::memory_order_relaxed);
+  return ms;
 }
 
 Status DB::Impl::WriteManifest() {
@@ -535,6 +567,7 @@ static bool Overlaps(const std::string& a_min, const std::string& a_max, const s
 }
 
 Status DB::Impl::CompactLevel(std::size_t level) {
+  auto start = std::chrono::steady_clock::now();
   std::vector<TableRef> inputs;
   std::vector<TableRef> next_inputs;
   {
@@ -628,6 +661,11 @@ Status DB::Impl::CompactLevel(std::size_t level) {
   s = write_outputs(compacted, level + 1, outputs);
   if (!s.ok()) return s;
 
+  std::uint64_t input_bytes = 0;
+  for (const auto& t : inputs) input_bytes += t.size;
+  for (const auto& t : next_inputs) input_bytes += t.size;
+  std::uint64_t output_bytes = 0;
+
   std::unique_lock lock(sstable_mu_);
   if (levels_.size() <= level + 1) levels_.resize(level + 2);
   // Remove old files from level and next.
@@ -646,6 +684,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
   // Add outputs to next level.
   for (auto& t : outputs) {
     levels_[level + 1].push_back(std::move(t));
+    output_bytes += levels_[level + 1].back().size;
   }
   if (level + 1 > 0) {
     std::sort(levels_[level + 1].begin(), levels_[level + 1].end(),
@@ -661,7 +700,14 @@ Status DB::Impl::CompactLevel(std::size_t level) {
     std::error_code ec;
     std::filesystem::remove(t.table->path(), ec);
   }
-  return WriteManifest();
+  Status ms = WriteManifest();
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+                     .count();
+  metrics_.compactions.fetch_add(1, std::memory_order_relaxed);
+  metrics_.compaction_ms.fetch_add(static_cast<std::uint64_t>(elapsed), std::memory_order_relaxed);
+  metrics_.compaction_input_bytes.fetch_add(input_bytes, std::memory_order_relaxed);
+  metrics_.compaction_output_bytes.fetch_add(output_bytes, std::memory_order_relaxed);
+  return ms;
 }
 
 Status DB::Impl::Compact() {
@@ -670,6 +716,23 @@ Status DB::Impl::Compact() {
   Status s = FlushLocked();
   if (!s.ok()) return s;
   return MaybeCompactLocked();
+}
+
+Metrics DB::Impl::GetMetrics() const {
+  Metrics m;
+  m.puts = metrics_.puts.load(std::memory_order_relaxed);
+  m.deletes = metrics_.deletes.load(std::memory_order_relaxed);
+  m.gets = metrics_.gets.load(std::memory_order_relaxed);
+  m.batches = metrics_.batches.load(std::memory_order_relaxed);
+  m.flushes = metrics_.flushes.load(std::memory_order_relaxed);
+  m.flush_ms = metrics_.flush_ms.load(std::memory_order_relaxed);
+  m.flush_bytes = metrics_.flush_bytes.load(std::memory_order_relaxed);
+  m.compactions = metrics_.compactions.load(std::memory_order_relaxed);
+  m.compaction_ms = metrics_.compaction_ms.load(std::memory_order_relaxed);
+  m.compaction_input_bytes = metrics_.compaction_input_bytes.load(std::memory_order_relaxed);
+  m.compaction_output_bytes = metrics_.compaction_output_bytes.load(std::memory_order_relaxed);
+  m.wal_syncs = metrics_.wal_syncs.load(std::memory_order_relaxed);
+  return m;
 }
 
 DB::DB(Options options) : impl_(new Impl(std::move(options))) {}
@@ -710,5 +773,7 @@ Status DB::Scan(const ReadOptions& options, std::string_view from, std::size_t l
                 std::vector<std::pair<std::string, std::string>>& out) {
   return impl_->Scan(options, from, limit, out);
 }
+
+Metrics DB::GetMetrics() const { return impl_->GetMetrics(); }
 
 }  // namespace dkv

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -32,6 +33,24 @@ class WriteBatch {
   std::vector<BatchOp> ops_;
 };
 
+struct Metrics {
+  std::uint64_t puts{0};
+  std::uint64_t deletes{0};
+  std::uint64_t gets{0};
+  std::uint64_t batches{0};
+
+  std::uint64_t flushes{0};
+  std::uint64_t flush_ms{0};
+  std::uint64_t flush_bytes{0};
+
+  std::uint64_t compactions{0};
+  std::uint64_t compaction_ms{0};
+  std::uint64_t compaction_input_bytes{0};
+  std::uint64_t compaction_output_bytes{0};
+
+  std::uint64_t wal_syncs{0};
+};
+
 class DB {
  public:
   DB(const DB&) = delete;
@@ -51,6 +70,7 @@ class DB {
   // Collects up to limit sorted key/value pairs starting at "from" (inclusive).
   Status Scan(const ReadOptions& options, std::string_view from, std::size_t limit,
               std::vector<std::pair<std::string, std::string>>& out);
+  Metrics GetMetrics() const;
 
  private:
   explicit DB(Options options);
