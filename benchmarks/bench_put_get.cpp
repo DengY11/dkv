@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "dkv/db.h"
@@ -183,6 +184,175 @@ CrudStats BenchDKVBatch(std::size_t n, std::size_t batch_size) {
   return stats;
 }
 
+CrudStats BenchDKVMultithread(std::size_t n_threads, std::size_t ops_per_thread) {
+  CrudStats stats;
+  auto dir = TempDir("dkv-bench-mt");
+
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 512 * 1024 * 1024;
+  opts.sync_wal = false;
+  opts.wal_sync_interval_ms = 0;  // focus on pure concurrency, no background sync
+
+  std::unique_ptr<dkv::DB> db;
+  EnsureOk(dkv::DB::Open(opts, db), "open dkv mt");
+
+  dkv::WriteOptions wopts;
+  dkv::ReadOptions ropts;
+
+  // Generate unique keys per thread to avoid overwriting each other's data.
+  auto worker = [&](std::size_t tid, std::size_t count, double& put_ms, double& get_ms) {
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      keys.push_back("t" + std::to_string(tid) + "-k" + std::to_string(i));
+    }
+    auto start_put = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < count; ++i) {
+      EnsureOk(db->Put(wopts, keys[i], "v" + std::to_string(i)), "mt put");
+    }
+    put_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_put)
+                 .count();
+
+    std::string value;
+    auto start_get = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < count; ++i) {
+      EnsureOk(db->Get(ropts, keys[i], value), "mt get");
+    }
+    get_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_get)
+                 .count();
+  };
+
+  std::vector<std::thread> threads;
+  std::vector<double> put_times(n_threads, 0.0);
+  std::vector<double> get_times(n_threads, 0.0);
+
+  auto start_all = std::chrono::steady_clock::now();
+  for (std::size_t t = 0; t < n_threads; ++t) {
+    threads.emplace_back(worker, t, ops_per_thread, std::ref(put_times[t]), std::ref(get_times[t]));
+  }
+  for (auto& th : threads) th.join();
+  auto elapsed_total =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_all)
+          .count();
+
+  // Aggregate: total ops = threads * ops_per_thread.
+  const std::size_t total_ops = n_threads * ops_per_thread;
+  // For per-op latency, use slowest thread; for throughput, use wall-clock.
+  double worst_put_ms = 0, worst_get_ms = 0;
+  for (std::size_t i = 0; i < n_threads; ++i) {
+    worst_put_ms = std::max(worst_put_ms, put_times[i]);
+    worst_get_ms = std::max(worst_get_ms, get_times[i]);
+  }
+  stats.put_ms = worst_put_ms;
+  stats.get_ms = worst_get_ms;
+  // Store update/delete as total wall clock to keep PrintStats format.
+  stats.update_ms = elapsed_total;
+  stats.delete_ms = 0;
+
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return stats;
+}
+
+#if DKV_HAVE_SQLITE
+// Forward declarations for helpers defined below.
+bool CheckSQLite(int rc, sqlite3* db, const char* msg);
+void RequireSQLite(int rc, sqlite3* db, const char* msg);
+CrudStats BenchSQLiteMultithread(std::size_t n_threads, std::size_t ops_per_thread) {
+  CrudStats stats;
+  auto dir = TempDir("sqlite-bench-mt");
+  auto db_path = dir / "bench.db";
+
+  // Set up DB and WAL mode once to avoid pragma lock contention.
+  {
+    sqlite3* db = nullptr;
+    RequireSQLite(sqlite3_open(db_path.string().c_str(), &db), db, "mt init open");
+    RequireSQLite(sqlite3_busy_timeout(db, 10000), db, "mt init busy timeout");
+    RequireSQLite(sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr), db,
+                  "mt init pragma wal");
+    RequireSQLite(sqlite3_exec(db, "PRAGMA synchronous=OFF;", nullptr, nullptr, nullptr), db,
+                  "mt init pragma sync");
+    RequireSQLite(sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);",
+                               nullptr, nullptr, nullptr),
+                  db, "mt init create");
+    sqlite3_close(db);
+  }
+
+  auto worker = [&](std::size_t tid, std::size_t count, double& put_ms, double& get_ms) {
+    sqlite3* db = nullptr;
+    RequireSQLite(sqlite3_open(db_path.string().c_str(), &db), db, "mt open sqlite");
+    RequireSQLite(sqlite3_busy_timeout(db, 10000), db, "mt busy timeout");
+
+    sqlite3_stmt* put_stmt = nullptr;
+    sqlite3_stmt* get_stmt = nullptr;
+    RequireSQLite(sqlite3_prepare_v2(db, "REPLACE INTO kv(k,v) VALUES(?,?);", -1, &put_stmt, nullptr),
+                  db, "mt prepare put");
+    RequireSQLite(sqlite3_prepare_v2(db, "SELECT v FROM kv WHERE k=?;", -1, &get_stmt, nullptr), db,
+                  "mt prepare get");
+
+    auto start_put = std::chrono::steady_clock::now();
+    RequireSQLite(sqlite3_exec(db, "BEGIN;", nullptr, nullptr, nullptr), db, "mt begin put");
+    for (std::size_t i = 0; i < count; ++i) {
+      auto key = "t" + std::to_string(tid) + "-k" + std::to_string(i);
+      auto value = "v" + std::to_string(i);
+      sqlite3_bind_text(put_stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+      sqlite3_bind_text(put_stmt, 2, value.c_str(), -1, SQLITE_TRANSIENT);
+      RequireSQLite(sqlite3_step(put_stmt), db, "mt put step");
+      sqlite3_reset(put_stmt);
+    }
+    RequireSQLite(sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr), db, "mt commit put");
+    put_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_put)
+                 .count();
+
+    std::string value;
+    auto start_get = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < count; ++i) {
+      auto key = "t" + std::to_string(tid) + "-k" + std::to_string(i);
+      sqlite3_bind_text(get_stmt, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+      RequireSQLite(sqlite3_step(get_stmt), db, "mt get step");
+      sqlite3_reset(get_stmt);
+    }
+    get_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_get)
+                 .count();
+
+    sqlite3_finalize(put_stmt);
+    sqlite3_finalize(get_stmt);
+    sqlite3_close(db);
+  };
+
+  std::vector<std::thread> threads;
+  std::vector<double> put_times(n_threads, 0.0);
+  std::vector<double> get_times(n_threads, 0.0);
+
+  auto start_all = std::chrono::steady_clock::now();
+  for (std::size_t t = 0; t < n_threads; ++t) {
+    threads.emplace_back(worker, t, ops_per_thread, std::ref(put_times[t]), std::ref(get_times[t]));
+  }
+  for (auto& th : threads) th.join();
+  auto elapsed_total =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_all)
+          .count();
+
+  double worst_put_ms = 0, worst_get_ms = 0;
+  for (std::size_t i = 0; i < n_threads; ++i) {
+    worst_put_ms = std::max(worst_put_ms, put_times[i]);
+    worst_get_ms = std::max(worst_get_ms, get_times[i]);
+  }
+  stats.put_ms = worst_put_ms;
+  stats.get_ms = worst_get_ms;
+  stats.update_ms = elapsed_total;
+  stats.delete_ms = 0;
+
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return stats;
+}
+#endif  // DKV_HAVE_SQLITE
 #if DKV_HAVE_SQLITE
 bool CheckSQLite(int rc, sqlite3* db, const char* msg) {
   if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW) {
@@ -302,6 +472,8 @@ void PrintStats(const std::string& label, std::size_t n, const CrudStats& s) {
 int main() {
   const std::size_t kN = 100000;
   const std::size_t kBatch = 5000;
+  const std::size_t kThreads = 8;
+  const std::size_t kOpsPerThread = 20000;
 
   std::cout << "Benchmarking " << kN << " ops\n";
 
@@ -313,10 +485,28 @@ int main() {
   std::cout << "\nDKV (batched writes, batch size " << kBatch << ")\n";
   PrintStats("  ", kN, dkv_batch);
 
+  auto dkv_mt = BenchDKVMultithread(kThreads, kOpsPerThread);
+  std::cout << "\nDKV (multithreaded, " << kThreads << " threads, " << kOpsPerThread << " ops each)\n";
+  std::cout << "  put (worst thread): " << dkv_mt.put_ms << " ms  ("
+            << OpsPerSec(kOpsPerThread, dkv_mt.put_ms) << " ops/sec/thread)\n";
+  std::cout << "  get (worst thread): " << dkv_mt.get_ms << " ms  ("
+            << OpsPerSec(kOpsPerThread, dkv_mt.get_ms) << " ops/sec/thread)\n";
+  std::cout << "  total wall time (put+get): " << dkv_mt.update_ms << " ms  ("
+            << OpsPerSec(kThreads * kOpsPerThread * 2, dkv_mt.update_ms) << " ops/sec total)\n";
+
 #if DKV_HAVE_SQLITE
   auto sqlite_stats = BenchSQLite(kN, kBatch);
   std::cout << "\nSQLite (txn + prepared statements)\n";
   PrintStats("  ", kN, sqlite_stats);
+
+  auto sqlite_mt = BenchSQLiteMultithread(kThreads, kOpsPerThread);
+  std::cout << "\nSQLite (multithreaded, " << kThreads << " threads, " << kOpsPerThread << " ops each)\n";
+  std::cout << "  put (worst thread): " << sqlite_mt.put_ms << " ms  ("
+            << OpsPerSec(kOpsPerThread, sqlite_mt.put_ms) << " ops/sec/thread)\n";
+  std::cout << "  get (worst thread): " << sqlite_mt.get_ms << " ms  ("
+            << OpsPerSec(kOpsPerThread, sqlite_mt.get_ms) << " ops/sec/thread)\n";
+  std::cout << "  total wall time (put+get): " << sqlite_mt.update_ms << " ms  ("
+            << OpsPerSec(kThreads * kOpsPerThread * 2, sqlite_mt.update_ms) << " ops/sec total)\n";
 #else
   std::cout << "\nSQLite bench skipped (DKV_HAVE_SQLITE=0)\n";
 #endif
