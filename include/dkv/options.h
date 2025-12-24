@@ -25,6 +25,8 @@ struct Options {
   std::size_t level_base_bytes{128 * 1024 * 1024};
   std::size_t level_size_multiplier{10};
   std::size_t max_levels{4};
+  // Periodic WAL sync interval in milliseconds (0 disables background sync).
+  std::size_t wal_sync_interval_ms{0};
 };
 
 struct WriteOptions {

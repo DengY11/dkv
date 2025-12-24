@@ -66,7 +66,7 @@ CrudStats BenchDKVSingle(std::size_t n) {
   opts.bloom_bits_per_key = 8;
   opts.level0_file_limit = 8;
   opts.sstable_target_size_bytes = 16 * 1024 * 1024;
-
+  opts.wal_sync_interval_ms = 5;
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv single");
 
@@ -124,6 +124,7 @@ CrudStats BenchDKVBatch(std::size_t n, std::size_t batch_size) {
   opts.bloom_bits_per_key = 8;
   opts.level0_file_limit = 8;
   opts.sstable_target_size_bytes = 16 * 1024 * 1024;
+  opts.wal_sync_interval_ms = 5;
 
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv batch");

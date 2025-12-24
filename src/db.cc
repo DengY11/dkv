@@ -2,12 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -25,6 +27,7 @@ class DB::Impl {
         data_dir_(options_.data_dir),
         wal_path_(data_dir_ / "wal.log"),
         sst_dir_(data_dir_ / "sst") {}
+  ~Impl();
 
   Status Init();
 
@@ -38,6 +41,9 @@ class DB::Impl {
               std::vector<std::pair<std::string, std::string>>& out);
 
  private:
+  void StartWalSyncThread();
+  void StopWalSyncThread();
+  void WalSyncLoop();
   Status FlushLocked();
   Status LoadSSTables();
   Status MaybeCompactLocked();
@@ -56,6 +62,11 @@ class DB::Impl {
 
   std::mutex mu_;  // guards mem_, wal_ operations, seq_ and flush/compaction exclusivity.
   std::uint64_t next_seq_{1};
+
+  std::thread wal_sync_thread_;
+  std::condition_variable wal_sync_cv_;
+  std::mutex wal_sync_mu_;
+  bool stop_wal_sync_{false};
 
   struct TableRef {
     std::shared_ptr<SSTable> table;
@@ -104,7 +115,34 @@ Status DB::Impl::Init() {
   if (options_.block_cache_capacity_bytes > 0) {
     block_cache_ = std::make_shared<BlockCache>(options_.block_cache_capacity_bytes);
   }
+  StartWalSyncThread();
   return Status::OK();
+}
+
+void DB::Impl::StartWalSyncThread() {
+  if (options_.wal_sync_interval_ms == 0 || options_.sync_wal) return;
+  stop_wal_sync_ = false;
+  wal_sync_thread_ = std::thread([this] { WalSyncLoop(); });
+}
+
+void DB::Impl::StopWalSyncThread() {
+  {
+    std::lock_guard lk(wal_sync_mu_);
+    stop_wal_sync_ = true;
+  }
+  wal_sync_cv_.notify_all();
+  if (wal_sync_thread_.joinable()) wal_sync_thread_.join();
+}
+
+void DB::Impl::WalSyncLoop() {
+  const auto interval = std::chrono::milliseconds(options_.wal_sync_interval_ms);
+  std::unique_lock lk(wal_sync_mu_);
+  while (!stop_wal_sync_) {
+    if (wal_sync_cv_.wait_for(lk, interval, [this] { return stop_wal_sync_; })) break;
+    lk.unlock();
+    wal_->Sync(false);
+    lk.lock();
+  }
 }
 
 Status DB::Impl::LoadSSTables() {
@@ -543,6 +581,8 @@ Status DB::Impl::Compact() {
 
 DB::DB(Options options) : impl_(new Impl(std::move(options))) {}
 DB::~DB() = default;
+
+DB::Impl::~Impl() { StopWalSyncThread(); }
 
 Status DB::Open(const Options& options, std::unique_ptr<DB>& db) {
   auto impl = std::make_unique<Impl>(options);
