@@ -2,11 +2,29 @@
 
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <utility>
 
 #include "util.h"
 
 namespace dkv {
+
+namespace {
+
+inline void AppendU8(std::string& buf, std::uint8_t v) { buf.push_back(static_cast<char>(v)); }
+
+inline void AppendU32(std::string& buf, std::uint32_t v) {
+  buf.push_back(static_cast<char>(v & 0xFFu));
+  buf.push_back(static_cast<char>((v >> 8u) & 0xFFu));
+  buf.push_back(static_cast<char>((v >> 16u) & 0xFFu));
+  buf.push_back(static_cast<char>((v >> 24u) & 0xFFu));
+}
+
+inline void AppendU64(std::string& buf, std::uint64_t v) {
+  for (int i = 0; i < 8; ++i) buf.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
+}
+
+}  // namespace
 
 WAL::WAL(std::filesystem::path path, bool sync_by_default)
     : path_(std::move(path)), sync_by_default_(sync_by_default) {}
@@ -49,12 +67,31 @@ Status WAL::Replay(const std::function<void(std::uint64_t, bool, std::string&&, 
     if (type == static_cast<std::uint8_t>(WalRecordType::kPut)) {
       value.assign(value_size, '\0');
       if (!in.read(value.data(), static_cast<std::streamsize>(value_size))) break;
-      apply(seq, false, std::move(key), std::move(value));
     } else {
       if (value_size != 0) {
         // Corrupt entry; stop replay to avoid applying garbage.
         break;
       }
+    }
+    std::uint32_t stored_crc = 0;
+    if (!ReadU32(in, stored_crc)) break;
+
+    std::string buf;
+    buf.reserve(1 + sizeof(std::uint64_t) + sizeof(std::uint32_t) * 2 + key.size() + value.size());
+    AppendU8(buf, type);
+    AppendU64(buf, seq);
+    AppendU32(buf, static_cast<std::uint32_t>(key.size()));
+    AppendU32(buf, static_cast<std::uint32_t>(value.size()));
+    buf.append(key);
+    buf.append(value);
+    const auto computed = CRC32(buf);
+    if (computed != stored_crc) {
+      break;  // stop at first bad record
+    }
+
+    if (type == static_cast<std::uint8_t>(WalRecordType::kPut)) {
+      apply(seq, false, std::move(key), std::move(value));
+    } else {
       apply(seq, true, std::move(key), std::move(value));
     }
   }
@@ -70,6 +107,8 @@ Status WAL::Reset() {
   out_.open(path_, std::ios::binary | std::ios::app);
   if (!out_) return Status::IOError("failed to reset WAL: " + path_.string());
   dirty_ = false;
+  auto s = SyncParentDir(path_);
+  if (!s.ok()) return s;
   return Status::OK();
 }
 
@@ -78,15 +117,20 @@ Status WAL::AppendRecord(WalRecordType type, std::uint64_t seq, std::string_view
   std::lock_guard lock(mu_);
   if (!out_.is_open()) return Status::IOError("wal not open");
 
-  WriteU8(out_, static_cast<std::uint8_t>(type));
-  WriteU64(out_, seq);
-  WriteU32(out_, static_cast<std::uint32_t>(key.size()));
-  WriteU32(out_, static_cast<std::uint32_t>(value.size()));
-  out_.write(key.data(), static_cast<std::streamsize>(key.size()));
-  out_.write(value.data(), static_cast<std::streamsize>(value.size()));
+  std::string buf;
+  buf.reserve(1 + sizeof(std::uint64_t) + sizeof(std::uint32_t) * 2 + key.size() + value.size());
+  AppendU8(buf, static_cast<std::uint8_t>(type));
+  AppendU64(buf, seq);
+  AppendU32(buf, static_cast<std::uint32_t>(key.size()));
+  AppendU32(buf, static_cast<std::uint32_t>(value.size()));
+  buf.append(key);
+  buf.append(value);
+  const auto crc = CRC32(buf);
+
+  out_.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+  WriteU32(out_, crc);
   if (!out_) return Status::IOError("failed to append WAL");
-  //in disk every entry was like this:
-  //[type:1][seq:8][klen:4][vlen:4][key:klen][value:vlen]
+  // on disk: [type:1][seq:8][klen:4][vlen:4][key][value][crc32]
 
   dirty_ = true;
   if (sync) {

@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <string_view>
 
 #include "dkv/status.h"
 
@@ -59,5 +60,7 @@ inline bool ReadU64(std::istream& is, std::uint64_t& value) {
 
 std::optional<std::uint64_t> FileSize(const std::filesystem::path& path);
 Status SyncFileToDisk(const std::filesystem::path& path);
+Status SyncParentDir(const std::filesystem::path& path);
+std::uint32_t CRC32(std::string_view data);
 
 }  // namespace dkv

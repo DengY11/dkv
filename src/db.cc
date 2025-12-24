@@ -8,8 +8,10 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -41,11 +43,14 @@ class DB::Impl {
               std::vector<std::pair<std::string, std::string>>& out);
 
  private:
+  struct TableRef;
   void StartWalSyncThread();
   void StopWalSyncThread();
   void WalSyncLoop();
   Status FlushLocked();
   Status LoadSSTables();
+  Status LoadManifest(std::vector<std::vector<TableRef>>& loaded);
+  Status WriteManifest();
   Status MaybeCompactLocked();
   Status CompactLevel(std::size_t level);
   std::uint64_t LevelMaxBytes(std::size_t level) const;
@@ -147,6 +152,17 @@ void DB::Impl::WalSyncLoop() {
 
 Status DB::Impl::LoadSSTables() {
   std::vector<std::vector<TableRef>> loaded;
+  // Try manifest first.
+  if (std::filesystem::exists(data_dir_ / "MANIFEST")) {
+    Status ms = LoadManifest(loaded);
+    if (!ms.ok()) return ms;
+  }
+  if (!loaded.empty()) {
+    std::unique_lock lock(sstable_mu_);
+    levels_ = std::move(loaded);
+    return Status::OK();
+  }
+
   auto ensure_level = [&loaded](std::size_t level) {
     if (loaded.size() <= level) loaded.resize(level + 1);
   };
@@ -192,7 +208,7 @@ Status DB::Impl::LoadSSTables() {
 
   std::unique_lock lock(sstable_mu_);
   levels_ = std::move(loaded);
-  return Status::OK();
+  return WriteManifest();
 }
 
 Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string value) {
@@ -379,6 +395,83 @@ Status DB::Impl::FlushLocked() {
                     TableRef{table, table->min_key(), table->max_key(), table->file_size()});
   std::sort(levels_[0].begin(), levels_[0].end(),
             [](const TableRef& a, const TableRef& b) { return a.table->max_sequence() > b.table->max_sequence(); });
+  return WriteManifest();
+}
+
+Status DB::Impl::WriteManifest() {
+  std::vector<std::tuple<std::size_t, std::string, std::string, std::string, std::uint64_t, std::uint64_t>> entries;
+  for (std::size_t lvl = 0; lvl < levels_.size(); ++lvl) {
+    for (const auto& t : levels_[lvl]) {
+      auto rel = t.table->path().lexically_relative(data_dir_).string();
+      if (rel.empty() || rel[0] == '.') rel = t.table->path().filename().string();
+      entries.emplace_back(lvl, rel, t.min_key, t.max_key, t.size, t.table->max_sequence());
+    }
+  }
+
+  const auto manifest_tmp = data_dir_ / "MANIFEST.tmp";
+  const auto manifest = data_dir_ / "MANIFEST";
+  {
+    std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) return Status::IOError("open MANIFEST.tmp failed");
+    out << "MANIFEST 1\n";
+    for (const auto& e : entries) {
+      out << std::get<0>(e) << "|" << std::get<1>(e) << "|" << std::get<2>(e) << "|" << std::get<3>(e) << "|"
+          << std::get<4>(e) << "|" << std::get<5>(e) << "\n";
+    }
+    out.flush();
+    if (!out) return Status::IOError("write MANIFEST.tmp failed");
+  }
+  Status s = SyncFileToDisk(manifest_tmp);
+  if (!s.ok()) return s;
+  s = SyncParentDir(manifest_tmp);
+  if (!s.ok()) return s;
+  std::error_code ec;
+  std::filesystem::rename(manifest_tmp, manifest, ec);
+  if (ec) return Status::IOError("rename MANIFEST.tmp failed: " + ec.message());
+  s = SyncParentDir(manifest);
+  if (!s.ok()) return s;
+  return Status::OK();
+}
+
+Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
+  const auto manifest = data_dir_ / "MANIFEST";
+  std::ifstream in(manifest);
+  if (!in.is_open()) return Status::IOError("failed to open MANIFEST");
+  std::string header;
+  if (!std::getline(in, header)) return Status::Corruption("empty MANIFEST");
+  if (header != "MANIFEST 1") return Status::Corruption("unsupported MANIFEST version");
+
+  auto ensure_level = [&loaded](std::size_t level) {
+    if (loaded.size() <= level) loaded.resize(level + 1);
+  };
+
+  std::string line;
+  while (std::getline(in, line)) {
+    if (line.empty()) continue;
+    std::stringstream ss(line);
+    std::string lvl_str, path_str, min_key, max_key, size_str, max_seq_str;
+    if (!std::getline(ss, lvl_str, '|')) break;
+    if (!std::getline(ss, path_str, '|')) break;
+    if (!std::getline(ss, min_key, '|')) break;
+    if (!std::getline(ss, max_key, '|')) break;
+    if (!std::getline(ss, size_str, '|')) break;
+    if (!std::getline(ss, max_seq_str, '|')) break;
+    std::size_t level = 0;
+    std::uint64_t size = 0;
+    try {
+      level = static_cast<std::size_t>(std::stoul(lvl_str));
+      size = static_cast<std::uint64_t>(std::stoull(size_str));
+      (void)std::stoull(max_seq_str);
+    } catch (...) {
+      return Status::Corruption("bad MANIFEST line");
+    }
+    auto path = data_dir_ / path_str;
+    std::shared_ptr<SSTable> table;
+    Status s = SSTable::Open(path, block_cache_, table);
+    if (!s.ok()) return s;
+    ensure_level(level);
+    loaded[level].push_back(TableRef{table, min_key, max_key, size == 0 ? table->file_size() : size});
+  }
   return Status::OK();
 }
 
@@ -568,7 +661,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
     std::error_code ec;
     std::filesystem::remove(t.table->path(), ec);
   }
-  return Status::OK();
+  return WriteManifest();
 }
 
 Status DB::Impl::Compact() {
