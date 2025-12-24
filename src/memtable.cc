@@ -6,23 +6,26 @@
 
 namespace dkv {
 
-Status MemTable::Put(std::uint64_t seq, std::string key, std::string value) {
+Status MemTable::Put(std::uint64_t seq, std::string_view key, std::string_view value) {
   std::unique_lock lock(mu_);
   auto it = table_.find(key);
   if (it != table_.end()) {
     memory_usage_ -= it->second.value.size();
-    it->second.value = std::move(value);
+    it->second.value.assign(value.data(), value.size());
     it->second.seq = seq;
     it->second.deleted = false;
     memory_usage_ += it->second.value.size();
   } else {
-    memory_usage_ += key.size() + value.size();
-    table_.emplace(std::move(key), MemValue{std::move(value), seq, false});
+    auto* res = table_.get_allocator().resource();
+    std::pmr::string key_copy{key, res};
+    std::pmr::string value_copy{value, res};
+    memory_usage_ += key_copy.size() + value_copy.size();
+    table_.emplace(std::move(key_copy), MemValue{std::move(value_copy), seq, false});
   }
   return Status::OK();
 }
 
-Status MemTable::Delete(std::uint64_t seq, std::string key) {
+Status MemTable::Delete(std::uint64_t seq, std::string_view key) {
   std::unique_lock lock(mu_);
   auto it = table_.find(key);
   if (it != table_.end()) {
@@ -31,8 +34,10 @@ Status MemTable::Delete(std::uint64_t seq, std::string key) {
     it->second.seq = seq;
     it->second.deleted = true;
   } else {
-    memory_usage_ += key.size();
-    table_.emplace(std::move(key), MemValue{std::string(), seq, true});
+    auto* res = table_.get_allocator().resource();
+    std::pmr::string key_copy{key, res};
+    memory_usage_ += key_copy.size();
+    table_.emplace(std::move(key_copy), MemValue{std::pmr::string(res), seq, true});
   }
   return Status::OK();
 }
@@ -53,7 +58,8 @@ std::vector<MemEntry> MemTable::Snapshot() const {
   std::vector<MemEntry> out;
   out.reserve(table_.size());
   for (const auto& kv : table_) {
-    out.push_back(MemEntry{kv.first, kv.second.value, kv.second.seq, kv.second.deleted});
+    out.push_back(MemEntry{std::string(kv.first), std::string(kv.second.value), kv.second.seq,
+                           kv.second.deleted});
   }
   return out;
 }
@@ -61,6 +67,8 @@ std::vector<MemEntry> MemTable::Snapshot() const {
 void MemTable::Clear() {
   std::unique_lock lock(mu_);
   table_.clear();
+  buffer_.release();
+  table_ = decltype(table_)(&buffer_);
   memory_usage_ = 0;
 }
 

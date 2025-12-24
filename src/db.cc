@@ -84,9 +84,9 @@ Status DB::Impl::Init() {
                                          std::string&& value) {
     max_seq_seen = std::max(max_seq_seen, seq);
     if (deleted) {
-      mem_.Delete(seq, std::move(key));
+      mem_.Delete(seq, key);
     } else {
-      mem_.Put(seq, std::move(key), std::move(value));
+      mem_.Put(seq, key, value);
     }
   });
   if (!s.ok()) return s;
@@ -163,7 +163,7 @@ Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string v
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendPut(seq, key, value, sync_now);
   if (!s.ok()) return s;
-  s = mem_.Put(seq, std::move(key), std::move(value));
+  s = mem_.Put(seq, key, value);
   if (!s.ok()) return s;
   if (mem_.ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
     s = FlushLocked();
@@ -179,7 +179,7 @@ Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendDelete(seq, key, sync_now);
   if (!s.ok()) return s;
-  s = mem_.Delete(seq, std::move(key));
+  s = mem_.Delete(seq, key);
   if (!s.ok()) return s;
   if (mem_.ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
     s = FlushLocked();

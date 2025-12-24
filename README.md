@@ -53,3 +53,25 @@ See `docs/` for design notes and tuning tips.
 - `level0_file_limit`, `level_base_bytes`, `level_size_multiplier`: leveled compaction thresholds
 - `sstable_block_size_bytes`, `bloom_bits_per_key`: read-path trade-offs (Bloom and block index)
 - `block_cache_capacity_bytes`: enable LRU caching of SSTable blocks to cut repeated disk reads
+
+## Benchmark (DKV vs Sqlite)
+```bash
+Benchmarking 100000 ops
+DKV (single ops)
+   put:    80 ms  (1.25e+06 ops/sec)
+   get:    20 ms  (5e+06 ops/sec)
+   update: 44 ms  (2.27273e+06 ops/sec)
+   delete: 38 ms  (2.63158e+06 ops/sec)
+
+DKV (batched writes, batch size 5000)
+   put:    73 ms  (1.36986e+06 ops/sec)
+   get:    19 ms  (5.26316e+06 ops/sec)
+   update: 45 ms  (2.22222e+06 ops/sec)
+   delete: 41 ms  (2.43902e+06 ops/sec)
+
+SQLite (txn + prepared statements)
+   put:    121 ms  (826446 ops/sec)
+   get:    249 ms  (401606 ops/sec)
+   update: 181 ms  (552486 ops/sec)
+   delete: 105 ms  (952381 ops/sec)
+```
