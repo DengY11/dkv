@@ -123,7 +123,7 @@ Status DB::Impl::Init() {
   std::error_code ec;
   std::filesystem::create_directories(sst_dir_, ec);
 
-  wal_ = std::make_unique<WAL>(wal_path_, options_.sync_wal);
+  wal_ = std::make_unique<WAL>(wal_path_, options_.sync_wal, options_.enable_crc);
   Status s = wal_->Open();
   if (!s.ok()) return s;
 
@@ -150,7 +150,7 @@ Status DB::Impl::Init() {
 
   std::uint64_t max_seq_seen = 0;
   for (const auto& seg : wal_segments) {
-    WAL reader(seg.second, options_.sync_wal);
+    WAL reader(seg.second, options_.sync_wal, options_.enable_crc);
     Status rs = reader.Replay([this, &max_seq_seen](std::uint64_t seq, bool deleted, std::string&& key,
                                                     std::string&& value) {
       max_seq_seen = std::max(max_seq_seen, seq);
@@ -593,7 +593,7 @@ Status DB::Impl::RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem:
   std::error_code ec;
   std::filesystem::rename(wal_path_, rotated_path, ec);
   if (ec) return Status::IOError("failed to rotate wal: " + ec.message());
-  wal_ = std::make_unique<WAL>(wal_path_, options_.sync_wal);
+  wal_ = std::make_unique<WAL>(wal_path_, options_.sync_wal, options_.enable_crc);
   return wal_->Open();
 }
 

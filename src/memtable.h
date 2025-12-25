@@ -36,13 +36,13 @@ class MemTable {
  private:
   struct MemValue {
     // dont use MemEntry here because key is unnecessary
-    std::pmr::string value;
-    std::uint64_t seq{0};
-    bool deleted{false};
+  std::pmr::string value;
+  std::uint64_t seq{0};
+  bool deleted{false};
   };
 
   mutable std::shared_mutex mu_;
-  static constexpr std::size_t kInlineArenaSize = 64 * 1024;
+  static constexpr std::size_t kInlineArenaSize = 256 * 1024;
   alignas(std::max_align_t) std::array<std::byte, kInlineArenaSize> inline_arena_;
   std::pmr::monotonic_buffer_resource buffer_{inline_arena_.data(), inline_arena_.size()};
   std::pmr::map<std::pmr::string, MemValue, std::less<>> table_{&buffer_};

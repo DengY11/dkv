@@ -1,5 +1,6 @@
 #include "wal.h"
 
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -26,8 +27,8 @@ inline void AppendU64(std::string& buf, std::uint64_t v) {
 
 }  // namespace
 
-WAL::WAL(std::filesystem::path path, bool sync_by_default)
-    : path_(std::move(path)), sync_by_default_(sync_by_default) {}
+WAL::WAL(std::filesystem::path path, bool sync_by_default, bool enable_crc)
+    : path_(std::move(path)), sync_by_default_(sync_by_default), enable_crc_(enable_crc) {}
 
 WAL::~WAL() { out_.close(); }
 
@@ -63,8 +64,8 @@ Status WAL::Replay(const std::function<void(std::uint64_t, bool, std::string&&, 
     if (!ReadU8(in, type)) break;
 
     std::uint64_t seq = 0;
-    std::uint32_t key_size = 0;
-    std::uint32_t value_size = 0;
+  std::uint32_t key_size = 0;
+  std::uint32_t value_size = 0;
     if (!ReadU64(in, seq) || !ReadU32(in, key_size) || !ReadU32(in, value_size)) break;
     std::string key(key_size, '\0');
     if (!in.read(key.data(), static_cast<std::streamsize>(key_size))) break;
@@ -122,15 +123,27 @@ Status WAL::AppendRecord(WalRecordType type, std::uint64_t seq, std::string_view
   std::lock_guard lock(mu_);
   if (!out_.is_open()) return Status::IOError("wal not open");
 
-  std::string buf;
-  buf.reserve(1 + sizeof(std::uint64_t) + sizeof(std::uint32_t) * 2 + key.size() + value.size());
-  AppendU8(buf, static_cast<std::uint8_t>(type));
-  AppendU64(buf, seq);
-  AppendU32(buf, static_cast<std::uint32_t>(key.size()));
-  AppendU32(buf, static_cast<std::uint32_t>(value.size()));
-  buf.append(key);
-  buf.append(value);
-  const auto crc = CRC32(buf);
+  const std::size_t total = 1 + sizeof(std::uint64_t) + sizeof(std::uint32_t) * 2 + key.size() + value.size();
+  std::string buf(total, '\0');
+  char* p = buf.data();
+  *p++ = static_cast<char>(type);
+  std::uint64_t seq_le = seq;
+  std::memcpy(p, &seq_le, sizeof(seq_le));
+  p += sizeof(seq_le);
+  std::uint32_t klen = static_cast<std::uint32_t>(key.size());
+  std::uint32_t vlen = static_cast<std::uint32_t>(value.size());
+  std::memcpy(p, &klen, sizeof(klen));
+  p += sizeof(klen);
+  std::memcpy(p, &vlen, sizeof(vlen));
+  p += sizeof(vlen);
+  if (!key.empty()) {
+    std::memcpy(p, key.data(), key.size());
+    p += key.size();
+  }
+  if (!value.empty()) {
+    std::memcpy(p, value.data(), value.size());
+  }
+  const auto crc = enable_crc_ ? CRC32(buf) : 0;
 
   out_.write(buf.data(), static_cast<std::streamsize>(buf.size()));
   WriteU32(out_, crc);

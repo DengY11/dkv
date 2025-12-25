@@ -61,7 +61,7 @@ CrudStats BenchDKVSingle(std::size_t n) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 64 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 16 * 1024 * 1024;
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
@@ -108,6 +108,7 @@ CrudStats BenchDKVSingle(std::size_t n) {
                         std::chrono::steady_clock::now() - start_delete)
                         .count();
 
+  db.reset();  // ensure background flush/threads stop before deleting directory
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   return stats;
@@ -119,7 +120,7 @@ CrudStats BenchDKVBatch(std::size_t n, std::size_t batch_size) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 64 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 16 * 1024 * 1024;
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
@@ -179,6 +180,7 @@ CrudStats BenchDKVBatch(std::size_t n, std::size_t batch_size) {
                         std::chrono::steady_clock::now() - start_delete)
                         .count();
 
+  db.reset();  // ensure background flush/threads stop before deleting directory
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   return stats;
@@ -252,6 +254,7 @@ CrudStats BenchDKVMultithread(std::size_t n_threads, std::size_t ops_per_thread)
   stats.update_ms = elapsed_total;
   stats.delete_ms = 0;
 
+  db.reset();  // ensure background threads stop before deleting directory
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
   return stats;
@@ -470,10 +473,10 @@ void PrintStats(const std::string& label, std::size_t n, const CrudStats& s) {
 }  // namespace
 
 int main() {
-  const std::size_t kN = 100000;
-  const std::size_t kBatch = 5000;
-  const std::size_t kThreads = 8;
-  const std::size_t kOpsPerThread = 20000;
+  const std::size_t kN = 1000000;
+  const std::size_t kBatch = 50000;
+  const std::size_t kThreads = 20;
+  const std::size_t kOpsPerThread = 200000;
 
   std::cout << "Benchmarking " << kN << " ops\n";
 

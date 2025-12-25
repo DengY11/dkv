@@ -27,6 +27,8 @@ struct Options {
   std::size_t max_levels{4};
   // Periodic WAL sync interval in milliseconds (0 disables background sync).
   std::size_t wal_sync_interval_ms{0};
+  // Enable CRC32 for WAL records. Disable for performance experiments only.
+  bool enable_crc{true};
 };
 
 struct WriteOptions {

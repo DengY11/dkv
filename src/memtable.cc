@@ -17,8 +17,8 @@ Status MemTable::Put(std::uint64_t seq, std::string_view key, std::string_view v
     memory_usage_ += it->second.value.size();
   } else {
     auto* res = table_.get_allocator().resource();
-    std::pmr::string key_copy{key, res};
-    std::pmr::string value_copy{value, res};
+    std::pmr::string key_copy(key.begin(), key.end(), res);
+    std::pmr::string value_copy(value.begin(), value.end(), res);
     memory_usage_ += key_copy.size() + value_copy.size();
     table_.emplace(std::move(key_copy), MemValue{std::move(value_copy), seq, false});
   }
@@ -35,7 +35,7 @@ Status MemTable::Delete(std::uint64_t seq, std::string_view key) {
     it->second.deleted = true;
   } else {
     auto* res = table_.get_allocator().resource();
-    std::pmr::string key_copy{key, res};
+    std::pmr::string key_copy(key.begin(), key.end(), res);
     memory_usage_ += key_copy.size();
     table_.emplace(std::move(key_copy), MemValue{std::pmr::string(res), seq, true});
   }

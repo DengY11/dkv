@@ -82,7 +82,7 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len) {
 }  // namespace
 
 int main() {
-  const std::size_t n = 500000;
+  const std::size_t n = 5000000;
   const std::size_t key_len = 16;
   const std::size_t value_len = 100;
   BenchPut(n, key_len, value_len);

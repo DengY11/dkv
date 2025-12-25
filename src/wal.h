@@ -17,7 +17,7 @@ enum class WalRecordType : std::uint8_t { kPut = 0, kDelete = 1 };
 
 class WAL {
  public:
-  WAL(std::filesystem::path path, bool sync_by_default);
+  WAL(std::filesystem::path path, bool sync_by_default, bool enable_crc);
   ~WAL();
 
   const std::filesystem::path& path() const { return path_; }
@@ -37,6 +37,7 @@ class WAL {
 
   std::filesystem::path path_;
   bool sync_by_default_{false};
+  bool enable_crc_{true};
   std::ofstream out_;
   std::mutex mu_;
   bool dirty_{false};

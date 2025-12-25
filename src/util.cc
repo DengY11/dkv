@@ -2,7 +2,11 @@
 
 #include <cerrno>
 #include <cstring>
+#include <string_view>
 #include <system_error>
+#if defined(__SSE4_2__)
+#include <nmmintrin.h>
+#endif
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -98,11 +102,70 @@ constexpr std::uint32_t kCRC32Table[256] = {
 }  // namespace
 
 std::uint32_t CRC32(std::string_view data) {
+#if defined(__SSE4_2__)
+  const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data.data());
+  std::size_t len = data.size();
+  std::uint64_t crc = 0xFFFFFFFFu;
+  while (len >= sizeof(std::uint64_t)) {
+    crc = _mm_crc32_u64(crc, *reinterpret_cast<const std::uint64_t*>(ptr));
+    ptr += sizeof(std::uint64_t);
+    len -= sizeof(std::uint64_t);
+  }
+  if (len >= sizeof(std::uint32_t)) {
+    crc = _mm_crc32_u32(static_cast<std::uint32_t>(crc), *reinterpret_cast<const std::uint32_t*>(ptr));
+    ptr += sizeof(std::uint32_t);
+    len -= sizeof(std::uint32_t);
+  }
+  if (len >= sizeof(std::uint16_t)) {
+    crc = _mm_crc32_u16(static_cast<std::uint32_t>(crc), *reinterpret_cast<const std::uint16_t*>(ptr));
+    ptr += sizeof(std::uint16_t);
+    len -= sizeof(std::uint16_t);
+  }
+  if (len) {
+    crc = _mm_crc32_u8(static_cast<std::uint32_t>(crc), *ptr);
+  }
+  return static_cast<std::uint32_t>(crc) ^ 0xFFFFFFFFu;
+#else
   std::uint32_t crc = 0xFFFFFFFFu;
   for (unsigned char c : data) {
     crc = (crc >> 8u) ^ kCRC32Table[(crc ^ c) & 0xFFu];
   }
   return crc ^ 0xFFFFFFFFu;
+#endif
+}
+
+std::size_t FastHash(std::string_view data) {
+#if defined(__SSE4_2__)
+  // Hardware CRC32 as a quick hash; xor size to mix short keys.
+  const unsigned char* ptr = reinterpret_cast<const unsigned char*>(data.data());
+  std::size_t len = data.size();
+  std::uint64_t h = 0;
+  while (len >= sizeof(std::uint64_t)) {
+    h = _mm_crc32_u64(h, *reinterpret_cast<const std::uint64_t*>(ptr));
+    ptr += sizeof(std::uint64_t);
+    len -= sizeof(std::uint64_t);
+  }
+  if (len >= sizeof(std::uint32_t)) {
+    h = _mm_crc32_u32(static_cast<std::uint32_t>(h), *reinterpret_cast<const std::uint32_t*>(ptr));
+    ptr += sizeof(std::uint32_t);
+    len -= sizeof(std::uint32_t);
+  }
+  while (len) {
+    h = _mm_crc32_u8(static_cast<std::uint32_t>(h), *ptr);
+    ++ptr;
+    --len;
+  }
+  h ^= data.size();
+  return static_cast<std::size_t>(h);
+#else
+  // FNV-1a fallback.
+  std::size_t h = 14695981039346656037ull;
+  for (unsigned char c : data) {
+    h ^= c;
+    h *= 1099511628211ull;
+  }
+  return h;
+#endif
 }
 
 }  // namespace dkv
