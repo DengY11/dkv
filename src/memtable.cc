@@ -9,10 +9,25 @@ namespace dkv {
 
 namespace {
 inline std::size_t KeyHash(std::string_view key) { return std::hash<std::string_view>{}(key); }
+
+struct TransparentHash {
+  using is_transparent = void;
+  std::size_t operator()(std::string_view key) const { return std::hash<std::string_view>{}(key); }
+};
+
+struct TransparentEq {
+  using is_transparent = void;
+  bool operator()(std::string_view a, std::string_view b) const { return a == b; }
+};
 }  // namespace
 
 struct MemTable::Shard {
-  Shard() : buffer_(inline_arena_.data(), inline_arena_.size()), table_{&buffer_} {}
+  explicit Shard(std::size_t reserve_buckets)
+      : buffer_(inline_arena_.data(), inline_arena_.size()),
+        table_(0, TransparentHash{}, TransparentEq{},
+               std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&buffer_}) {
+    if (reserve_buckets > 0) table_.reserve(reserve_buckets);
+  }
 
   Status Put(std::uint64_t seq, std::string_view key, std::string_view value) {
     std::unique_lock lk(mu_);
@@ -74,7 +89,8 @@ struct MemTable::Shard {
     std::unique_lock lk(mu_);
     table_.clear();
     buffer_.release();
-    table_ = decltype(table_)(&buffer_);
+    table_ = decltype(table_)(0, TransparentHash{}, TransparentEq{},
+                              std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&buffer_});
     memory_usage_ = 0;
   }
 
@@ -92,14 +108,17 @@ struct MemTable::Shard {
   static constexpr std::size_t kInlineArenaSize = 256 * 1024;
   alignas(std::max_align_t) std::array<std::byte, kInlineArenaSize> inline_arena_{};
   std::pmr::monotonic_buffer_resource buffer_;
-  std::pmr::map<std::pmr::string, MemValue, std::less<>> table_;
+  std::pmr::unordered_map<std::pmr::string, MemValue, TransparentHash, TransparentEq> table_;
   std::size_t memory_usage_{0};
 };
 
 MemTable::MemTable(std::size_t shard_count) : shard_count_(shard_count) {
   shards_.reserve(shard_count_);
+  // Rough per-shard reserve: assume average record size ~ (key+value ~ 128B) -> memtable_soft_limit / 128 / shards.
+  // Soft limit not passed here, so use a default of 1<<15 buckets (~32k) to avoid rehash storms.
+  const std::size_t reserve_buckets = 1 << 15;
   for (std::size_t i = 0; i < shard_count_; ++i) {
-    shards_.push_back(std::make_unique<Shard>());
+    shards_.push_back(std::make_unique<Shard>(reserve_buckets));
   }
 }
 
