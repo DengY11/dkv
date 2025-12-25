@@ -23,6 +23,13 @@ struct MemEntry {
  bool deleted{false};
 };
 
+struct MemEntryView {
+  std::string_view key;
+  std::string_view value;
+  std::uint64_t seq{0};
+  bool deleted{false};
+};
+
 class MemTable {
  public:
   explicit MemTable(std::size_t shard_count = 16);
@@ -32,6 +39,7 @@ class MemTable {
   bool Get(std::string_view key, MemEntry& entry) const;
 
   std::vector<MemEntry> Snapshot() const;
+  std::vector<MemEntryView> SnapshotViews() const;
   void Clear();
 
   [[nodiscard]] std::size_t ApproximateMemoryUsage() const;

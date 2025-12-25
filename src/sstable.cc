@@ -14,6 +14,81 @@ struct ParsedFooter {
   std::uint32_t block_count{0};
 };
 
+template <typename Entry>
+Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& entries, std::size_t block_size,
+                 std::size_t bloom_bits_per_key) {
+  if (entries.empty()) return Status::InvalidArgument("no entries to write");
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) {
+    return Status::IOError("failed to create sstable: " + path.string());
+  }
+
+  struct LocalIdx {
+    std::string key;
+    std::uint64_t offset{0};
+  };
+  std::vector<LocalIdx> blocks;
+  blocks.reserve(entries.size());
+  std::uint64_t max_seq = 0;
+  std::vector<std::string_view> bloom_keys;
+  bloom_keys.reserve(entries.size());
+
+  std::uint64_t block_start = static_cast<std::uint64_t>(out.tellp());
+  std::string block_first_key(entries.front().key);
+  blocks.push_back(LocalIdx{block_first_key, block_start});
+  std::uint64_t current_block_bytes = 0;
+
+  for (std::size_t i = 0; i < entries.size(); ++i) {
+    const auto& e = entries[i];
+    const std::string_view key_view = e.key;
+    const std::string_view value_view = e.value;
+    bloom_keys.push_back(key_view);
+    max_seq = std::max(max_seq, e.seq);
+
+    const auto before = static_cast<std::uint64_t>(out.tellp());
+    WriteU8(out, static_cast<std::uint8_t>(e.deleted ? 1 : 0));
+    WriteU64(out, e.seq);
+    WriteU32(out, static_cast<std::uint32_t>(key_view.size()));
+    WriteU32(out, static_cast<std::uint32_t>(value_view.size()));
+    out.write(key_view.data(), static_cast<std::streamsize>(key_view.size()));
+    out.write(value_view.data(), static_cast<std::streamsize>(value_view.size()));
+    current_block_bytes += static_cast<std::uint64_t>(out.tellp()) - before;
+
+    if (current_block_bytes >= block_size && i + 1 < entries.size()) {
+      block_start = static_cast<std::uint64_t>(out.tellp());
+      block_first_key.assign(entries[i + 1].key);
+      blocks.push_back(LocalIdx{block_first_key, block_start});
+      current_block_bytes = 0;
+    }
+  }
+
+  BloomFilter bloom = BloomFilter::Build(bloom_keys, static_cast<std::uint32_t>(bloom_bits_per_key));
+  const auto bloom_start = static_cast<std::uint64_t>(out.tellp());
+  WriteU32(out, static_cast<std::uint32_t>(bloom.bits_per_key()));
+  WriteU32(out, static_cast<std::uint32_t>(bloom.data().size()));
+  out.write(reinterpret_cast<const char*>(bloom.data().data()),
+            static_cast<std::streamsize>(bloom.data().size()));
+
+  const auto index_start = static_cast<std::uint64_t>(out.tellp());
+  for (const auto& idx : blocks) {
+    WriteU32(out, static_cast<std::uint32_t>(idx.key.size()));
+    out.write(idx.key.data(), static_cast<std::streamsize>(idx.key.size()));
+    WriteU64(out, idx.offset);
+  }
+
+  WriteU64(out, index_start);
+  WriteU64(out, bloom_start);
+  WriteU64(out, max_seq);
+  WriteU32(out, static_cast<std::uint32_t>(blocks.size()));
+  WriteU32(out, kSSTableMagic);
+  out.flush();
+  if (!out) return Status::IOError("failed to finish sstable: " + path.string());
+  return Status::OK();
+}
+
 bool ReadFooter(std::ifstream& in, std::uint64_t file_size, ParsedFooter& footer) {
   if (file_size < kSSTableFooterSize) return false;
   in.seekg(static_cast<std::streamoff>(file_size - kSSTableFooterSize));
@@ -42,70 +117,12 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
                      std::size_t block_size, std::size_t bloom_bits_per_key) {
-  if (entries.empty()) return Status::InvalidArgument("no entries to write");
-  std::error_code ec;
-  std::filesystem::create_directories(path.parent_path(), ec);
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key);
+}
 
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out.is_open()) {
-    return Status::IOError("failed to create sstable: " + path.string());
-  }
-
-  std::vector<BlockIndexEntry> blocks;
-  blocks.reserve(entries.size());
-  std::uint64_t max_seq = 0;
-  std::vector<std::string> bloom_keys;
-  bloom_keys.reserve(entries.size());
-
-  std::uint64_t block_start = static_cast<std::uint64_t>(out.tellp());
-  std::string block_first_key = entries.front().key;
-  blocks.push_back(BlockIndexEntry{block_first_key, block_start});
-  std::uint64_t current_block_bytes = 0;
-
-  for (std::size_t i = 0; i < entries.size(); ++i) {
-    const auto& e = entries[i];
-    bloom_keys.push_back(e.key);
-    max_seq = std::max(max_seq, e.seq);
-
-    const auto before = static_cast<std::uint64_t>(out.tellp());
-    WriteU8(out, static_cast<std::uint8_t>(e.deleted ? 1 : 0));
-    WriteU64(out, e.seq);
-    WriteU32(out, static_cast<std::uint32_t>(e.key.size()));
-    WriteU32(out, static_cast<std::uint32_t>(e.value.size()));
-    out.write(e.key.data(), static_cast<std::streamsize>(e.key.size()));
-    out.write(e.value.data(), static_cast<std::streamsize>(e.value.size()));
-    current_block_bytes += static_cast<std::uint64_t>(out.tellp()) - before;
-
-    if (current_block_bytes >= block_size && i + 1 < entries.size()) {
-      block_start = static_cast<std::uint64_t>(out.tellp());
-      block_first_key = entries[i + 1].key;
-      blocks.push_back(BlockIndexEntry{block_first_key, block_start});
-      current_block_bytes = 0;
-    }
-  }
-
-  BloomFilter bloom = BloomFilter::Build(bloom_keys, static_cast<std::uint32_t>(bloom_bits_per_key));
-  const auto bloom_start = static_cast<std::uint64_t>(out.tellp());
-  WriteU32(out, static_cast<std::uint32_t>(bloom.bits_per_key()));
-  WriteU32(out, static_cast<std::uint32_t>(bloom.data().size()));
-  out.write(reinterpret_cast<const char*>(bloom.data().data()),
-            static_cast<std::streamsize>(bloom.data().size()));
-
-  const auto index_start = static_cast<std::uint64_t>(out.tellp());
-  for (const auto& idx : blocks) {
-    WriteU32(out, static_cast<std::uint32_t>(idx.key.size()));
-    out.write(idx.key.data(), static_cast<std::streamsize>(idx.key.size()));
-    WriteU64(out, idx.offset);
-  }
-
-  WriteU64(out, index_start);
-  WriteU64(out, bloom_start);
-  WriteU64(out, max_seq);
-  WriteU32(out, static_cast<std::uint32_t>(blocks.size()));
-  WriteU32(out, kSSTableMagic);
-  out.flush();
-  if (!out) return Status::IOError("failed to finish sstable: " + path.string());
-  return Status::OK();
+Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
+                     std::size_t block_size, std::size_t bloom_bits_per_key) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key);
 }
 
 Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,

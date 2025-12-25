@@ -16,9 +16,11 @@
 
 namespace dkv {
 
-class SSTable {
+ class SSTable {
  public:
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
+                     std::size_t block_size, std::size_t bloom_bits_per_key);
+  static Status Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
                      std::size_t block_size, std::size_t bloom_bits_per_key);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     std::shared_ptr<SSTable>& out);

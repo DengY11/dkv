@@ -640,20 +640,19 @@ void DB::Impl::MaybeScheduleFlush() {
 
 Status DB::Impl::FlushImmutable(const ImmutableMem& imm) {
   auto start = std::chrono::steady_clock::now();
-  auto entries = imm.mem->Snapshot();
-  if (entries.empty()) {
+  auto entries_view = imm.mem->SnapshotViews();
+  if (entries_view.empty()) {
     std::error_code ec;
     std::filesystem::remove(imm.wal_path, ec);
     return Status::OK();
   }
 
   std::uint64_t max_seq = 0;
-  for (const auto& e : entries) max_seq = std::max(max_seq, e.seq);
+  for (const auto& e : entries_view) max_seq = std::max(max_seq, e.seq);
   const auto filename = "sst-l0-" + std::to_string(max_seq) + ".sst";
   const auto path = sst_dir_ / filename;
 
-  Status s =
-      SSTable::Write(path, entries, options_.sstable_block_size_bytes, options_.bloom_bits_per_key);
+  Status s = SSTable::Write(path, entries_view, options_.sstable_block_size_bytes, options_.bloom_bits_per_key);
   if (!s.ok()) return s;
 
   std::shared_ptr<SSTable> table;

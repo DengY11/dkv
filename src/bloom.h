@@ -12,6 +12,7 @@ class BloomFilter {
   BloomFilter() = default;
 
   static BloomFilter Build(const std::vector<std::string>& keys, std::uint32_t bits_per_key);
+  static BloomFilter Build(const std::vector<std::string_view>& keys, std::uint32_t bits_per_key);
 
   [[nodiscard]] bool MayContain(std::string_view key) const;
   [[nodiscard]] const std::vector<std::uint8_t>& data() const { return bits_; }

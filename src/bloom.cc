@@ -5,7 +5,9 @@
 
 namespace dkv {
 
-std::uint64_t BloomFilter::Hash64(std::string_view key) {
+namespace {
+
+std::uint64_t Hash64Impl(std::string_view key) {
   // FNV-1a 64-bit
   std::uint64_t hash = 0xcbf29ce484222325ULL;
   for (unsigned char c : key) {
@@ -15,9 +17,17 @@ std::uint64_t BloomFilter::Hash64(std::string_view key) {
   return hash;
 }
 
-BloomFilter BloomFilter::Build(const std::vector<std::string>& keys, std::uint32_t bits_per_key) {
-  BloomFilter f;
-  if (keys.empty() || bits_per_key == 0) return f;
+}  // namespace
+
+std::uint64_t BloomFilter::Hash64(std::string_view key) {
+  return Hash64Impl(key);
+}
+
+namespace {
+
+template <typename Range>
+void FillBits(const Range& keys, std::uint32_t bits_per_key, BloomFilter& out) {
+  if (keys.empty() || bits_per_key == 0) return;
 
   const std::uint32_t k = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(bits_per_key * 0.69));
   const std::uint32_t base_bits = static_cast<std::uint32_t>(keys.size() * bits_per_key);
@@ -25,7 +35,7 @@ BloomFilter BloomFilter::Build(const std::vector<std::string>& keys, std::uint32
   const std::uint32_t m = static_cast<std::uint32_t>(bits.size() * 8);
 
   for (const auto& key : keys) {
-    auto h = Hash64(key);
+    auto h = Hash64Impl(std::string_view(key));
     const std::uint32_t delta = static_cast<std::uint32_t>((h >> 17) | (h << 15));
     for (std::uint32_t i = 0; i < k; ++i) {
       const std::uint32_t bitpos = static_cast<std::uint32_t>((h + i * delta) % m);
@@ -33,10 +43,20 @@ BloomFilter BloomFilter::Build(const std::vector<std::string>& keys, std::uint32
     }
   }
 
-  f.bits_ = std::move(bits);
-  f.bits_per_key_ = bits_per_key;
-  f.k_ = k;
-  f.bit_size_ = m;
+  out.SetData(std::move(bits), bits_per_key, k);
+}
+
+}  // namespace
+
+BloomFilter BloomFilter::Build(const std::vector<std::string>& keys, std::uint32_t bits_per_key) {
+  BloomFilter f;
+  FillBits(keys, bits_per_key, f);
+  return f;
+}
+
+BloomFilter BloomFilter::Build(const std::vector<std::string_view>& keys, std::uint32_t bits_per_key) {
+  BloomFilter f;
+  FillBits(keys, bits_per_key, f);
   return f;
 }
 

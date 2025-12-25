@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <functional>
 #include <mutex>
+#include <queue>
 #include <utility>
 
 namespace dkv {
@@ -85,6 +86,15 @@ struct MemTable::Shard {
     }
   }
 
+  void SnapshotViews(std::vector<MemEntryView>& out) const {
+    std::shared_lock lk(mu_);
+    out.reserve(out.size() + table_.size());
+    for (const auto& kv : table_) {
+      out.push_back(MemEntryView{std::string_view(kv.first), std::string_view(kv.second.value), kv.second.seq,
+                                 kv.second.deleted});
+    }
+  }
+
   void Clear() {
     std::unique_lock lk(mu_);
     table_.clear();
@@ -140,14 +150,57 @@ bool MemTable::Get(std::string_view key, MemEntry& entry) const {
 }
 
 std::vector<MemEntry> MemTable::Snapshot() const {
+  auto views = SnapshotViews();
   std::vector<MemEntry> out;
-  for (const auto& shard : shards_) {
-    shard->Snapshot(out);
+  out.reserve(views.size());
+  for (const auto& v : views) {
+    out.push_back(MemEntry{std::string(v.key), std::string(v.value), v.seq, v.deleted});
   }
-  std::sort(out.begin(), out.end(), [](const MemEntry& a, const MemEntry& b) {
-    if (a.key == b.key) return a.seq > b.seq;
-    return a.key < b.key;
-  });
+  return out;
+}
+
+std::vector<MemEntryView> MemTable::SnapshotViews() const {
+  struct ShardBuf {
+    std::vector<MemEntryView> entries;
+  };
+  std::vector<ShardBuf> shards_sorted;
+  shards_sorted.reserve(shard_count_);
+  std::size_t total = 0;
+
+  for (const auto& shard : shards_) {
+    ShardBuf buf;
+    shard->SnapshotViews(buf.entries);
+    std::sort(buf.entries.begin(), buf.entries.end(),
+              [](const MemEntryView& a, const MemEntryView& b) { return a.key < b.key; });
+    total += buf.entries.size();
+    shards_sorted.push_back(std::move(buf));
+  }
+
+  std::vector<MemEntryView> out;
+  out.reserve(total);
+  struct HeapItem {
+    std::size_t shard_idx;
+    std::size_t elem_idx;
+  };
+  auto cmp = [&](const HeapItem& a, const HeapItem& b) {
+    return shards_sorted[a.shard_idx].entries[a.elem_idx].key >
+           shards_sorted[b.shard_idx].entries[b.elem_idx].key;
+  };
+  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
+  for (std::size_t i = 0; i < shards_sorted.size(); ++i) {
+    if (!shards_sorted[i].entries.empty()) heap.push(HeapItem{i, 0});
+  }
+
+  while (!heap.empty()) {
+    auto cur = heap.top();
+    heap.pop();
+    const auto& e = shards_sorted[cur.shard_idx].entries[cur.elem_idx];
+    out.push_back(e);
+    ++cur.elem_idx;
+    if (cur.elem_idx < shards_sorted[cur.shard_idx].entries.size()) {
+      heap.push(cur);
+    }
+  }
   return out;
 }
 
