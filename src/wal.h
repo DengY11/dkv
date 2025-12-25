@@ -5,6 +5,7 @@
 #include <fstream>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -19,7 +20,10 @@ class WAL {
   WAL(std::filesystem::path path, bool sync_by_default);
   ~WAL();
 
+  const std::filesystem::path& path() const { return path_; }
+
   Status Open();
+  void Close();
   Status AppendPut(std::uint64_t seq, std::string_view key, std::string_view value, bool sync);
   Status AppendDelete(std::uint64_t seq, std::string_view key, bool sync);
   Status Replay(const std::function<void(std::uint64_t seq, bool deleted, std::string&& key,

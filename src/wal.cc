@@ -31,6 +31,11 @@ WAL::WAL(std::filesystem::path path, bool sync_by_default)
 
 WAL::~WAL() { out_.close(); }
 
+void WAL::Close() {
+  std::lock_guard lock(mu_);
+  out_.close();
+}
+
 Status WAL::Open() {
   std::error_code ec;
   std::filesystem::create_directories(path_.parent_path(), ec);
