@@ -64,7 +64,7 @@ class DB::Impl {
   void MaybeScheduleFlush();
   void FlushThreadLoop();
   void EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
-  Status FlushImmutable(ImmutableMem&& imm);
+  Status FlushImmutable(const ImmutableMem& imm);
 
   Options options_;
   std::filesystem::path data_dir_;
@@ -78,7 +78,7 @@ class DB::Impl {
     std::filesystem::path wal_path;
     std::uint64_t max_seq{0};
   };
-  std::vector<ImmutableMem> immutables_;
+  std::vector<std::shared_ptr<ImmutableMem>> immutables_;
   std::thread flush_thread_;
   std::condition_variable flush_cv_;
   std::mutex flush_mu_;
@@ -385,7 +385,7 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
   {
     std::unique_lock lk(flush_mu_);
     for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
-      if (it->mem && it->mem->Get(key, entry)) {
+      if ((*it)->mem && (*it)->mem->Get(key, entry)) {
         if (entry.deleted) return Status::NotFound("deleted");
         value = entry.value;
         return Status::OK();
@@ -628,7 +628,8 @@ void DB::Impl::EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max
                                 std::filesystem::path wal_path) {
   {
     std::lock_guard lk(flush_mu_);
-    immutables_.push_back(ImmutableMem{std::move(mem), std::move(wal_path), max_seq});
+    immutables_.push_back(std::make_shared<ImmutableMem>(ImmutableMem{
+        std::move(mem), std::move(wal_path), max_seq}));
   }
   flush_cv_.notify_one();
 }
@@ -637,7 +638,7 @@ void DB::Impl::MaybeScheduleFlush() {
   // No-op: flush thread waits on condition variable; notify is done in EnqueueImmutable.
 }
 
-Status DB::Impl::FlushImmutable(ImmutableMem&& imm) {
+Status DB::Impl::FlushImmutable(const ImmutableMem& imm) {
   auto start = std::chrono::steady_clock::now();
   auto entries = imm.mem->Snapshot();
   if (entries.empty()) {
@@ -687,21 +688,21 @@ Status DB::Impl::FlushImmutable(ImmutableMem&& imm) {
 
 void DB::Impl::FlushThreadLoop() {
   while (true) {
-    ImmutableMem imm;
-    {
-      std::unique_lock lk(flush_mu_);
-      flush_cv_.wait(lk, [this] { return stop_flush_ || !immutables_.empty(); });
-      if (stop_flush_ && immutables_.empty()) break;
-      imm = std::move(immutables_.front());
-      immutables_.erase(immutables_.begin());
-    }
-    Status s = FlushImmutable(std::move(imm));
+    std::shared_ptr<ImmutableMem> imm;
+  {
+    std::unique_lock lk(flush_mu_);
+    flush_cv_.wait(lk, [this] { return stop_flush_ || !immutables_.empty(); });
+    if (stop_flush_ && immutables_.empty()) break;
+    imm = immutables_.front();
+  }
+    Status s = FlushImmutable(*imm);
     if (!s.ok()) {
       // Best-effort log.
       std::cerr << "FlushImmutable failed: " << s.ToString() << "\n";
     }
     {
       std::lock_guard lk(flush_mu_);
+      if (!immutables_.empty()) immutables_.erase(immutables_.begin());
       if (immutables_.empty()) {
         flush_cv_.notify_all();
       }

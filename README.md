@@ -56,32 +56,32 @@ See `docs/` for design notes and tuning tips.
 
 ## Benchmark (DKV vs Sqlite)
 ```bash
-Benchmarking 1000000 ops
+Benchmarking 100000000 ops
 DKV (single ops)
-   put:    974 ms  (1.02669e+06 ops/sec)
-   get:    264 ms  (3.78788e+06 ops/sec)
-   update: 638 ms  (1.5674e+06 ops/sec)
-   delete: 616 ms  (1.62338e+06 ops/sec)
+   put:    127164 ms  (786386 ops/sec)
+   get:    50640 ms  (1.97472e+06 ops/sec)
+   update: 134503 ms  (743478 ops/sec)
+   delete: 132494 ms  (754751 ops/sec)
 
-DKV (batched writes, batch size 5000)
-   put:    929 ms  (1.07643e+06 ops/sec)
-   get:    337 ms  (2.96736e+06 ops/sec)
-   update: 687 ms  (1.4556e+06 ops/sec)
-   delete: 637 ms  (1.56986e+06 ops/sec)
+DKV (batched writes, batch size 500000)
+   put:    131865 ms  (758351 ops/sec)
+   get:    61137 ms  (1.63567e+06 ops/sec)
+   update: 144900 ms  (690131 ops/sec)
+   delete: 143276 ms  (697954 ops/sec)
 
 DKV (multithreaded, 20 threads, 200000 ops each)
-  put (worst thread): 7788 ms  (25680.5 ops/sec/thread)
-  get (worst thread): 347 ms  (576369 ops/sec/thread)
-  total wall time (put+get): 8120 ms  (985222 ops/sec total)
+  put (worst thread): 7863 ms  (25435.6 ops/sec/thread)
+  get (worst thread): 362 ms  (552486 ops/sec/thread)
+  total wall time (put+get): 8201 ms  (975491 ops/sec total)
 
 SQLite (txn + prepared statements)
-   put:    1430 ms  (699301 ops/sec)
-   get:    2832 ms  (353107 ops/sec)
-   update: 1996 ms  (501002 ops/sec)
-   delete: 1244 ms  (803859 ops/sec)
+   put:    165597 ms  (603876 ops/sec)
+   get:    304237 ms  (328691 ops/sec)
+   update: 271286 ms  (368615 ops/sec)
+   delete: 162341 ms  (615987 ops/sec)
 
 SQLite (multithreaded, 20 threads, 200000 ops each)
-  put (worst thread): 10382 ms  (19264.1 ops/sec/thread)
+  put (worst thread): 10491 ms  (19064 ops/sec/thread)
   get (worst thread): 744 ms  (268817 ops/sec/thread)
-  total wall time (put+get): 11155 ms  (717167 ops/sec total)
+  total wall time (put+get): 11238 ms  (711870 ops/sec total)
 ```

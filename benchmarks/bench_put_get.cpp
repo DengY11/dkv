@@ -474,8 +474,8 @@ void PrintStats(const std::string& label, std::size_t n, const CrudStats& s) {
 }  // namespace
 
 int main() {
-  const std::size_t kN = 1000000;
-  const std::size_t kBatch = 5000;
+  const std::size_t kN = 100000000;
+  const std::size_t kBatch = 500000;
   const std::size_t kThreads = 20;
   const std::size_t kOpsPerThread = 200000;
 
