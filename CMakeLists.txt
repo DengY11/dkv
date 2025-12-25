@@ -4,6 +4,8 @@ project(dkv LANGUAGES CXX)
 option(DKV_BUILD_TESTS "Build unit tests" ON)
 option(DKV_BUILD_BENCHMARKS "Build benchmarks" ON)
 
+include(GNUInstallDirs)
+
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   message(STATUS "No build type selected, defaulting to Release")
   set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Choose the type of build." FORCE)
@@ -26,6 +28,11 @@ if(MSVC)
 else()
   target_compile_options(dkv PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+install(TARGETS dkv
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+  INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(DKV_BUILD_TESTS)
   enable_testing()
