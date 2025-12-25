@@ -68,6 +68,7 @@ CrudStats BenchDKVSingle(std::size_t n) {
   opts.level0_file_limit = 8;
   opts.sstable_target_size_bytes = 16 * 1024 * 1024;
   opts.wal_sync_interval_ms = 5;
+  opts.memtable_shard_count = 4;
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv single");
 

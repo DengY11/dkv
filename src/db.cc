@@ -382,6 +382,17 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
     return Status::OK();
   }
 
+  {
+    std::unique_lock lk(flush_mu_);
+    for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+      if (it->mem && it->mem->Get(key, entry)) {
+        if (entry.deleted) return Status::NotFound("deleted");
+        value = entry.value;
+        return Status::OK();
+      }
+    }
+  }
+
   std::shared_lock lock(sstable_mu_);
   if (!levels_.empty()) {
     // Level 0: check newest first, may overlap.

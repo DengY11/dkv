@@ -56,32 +56,32 @@ See `docs/` for design notes and tuning tips.
 
 ## Benchmark (DKV vs Sqlite)
 ```bash
-Benchmarking 100000 ops
+Benchmarking 1000000 ops
 DKV (single ops)
-   put:    107 ms  (934579 ops/sec)
-   get:    18 ms  (5.55556e+06 ops/sec)
-   update: 54 ms  (1.85185e+06 ops/sec)
-   delete: 45 ms  (2.22222e+06 ops/sec)
+   put:    974 ms  (1.02669e+06 ops/sec)
+   get:    264 ms  (3.78788e+06 ops/sec)
+   update: 638 ms  (1.5674e+06 ops/sec)
+   delete: 616 ms  (1.62338e+06 ops/sec)
 
 DKV (batched writes, batch size 5000)
-   put:    78 ms  (1.28205e+06 ops/sec)
-   get:    18 ms  (5.55556e+06 ops/sec)
-   update: 52 ms  (1.92308e+06 ops/sec)
-   delete: 47 ms  (2.12766e+06 ops/sec)
+   put:    929 ms  (1.07643e+06 ops/sec)
+   get:    337 ms  (2.96736e+06 ops/sec)
+   update: 687 ms  (1.4556e+06 ops/sec)
+   delete: 637 ms  (1.56986e+06 ops/sec)
 
-DKV (multithreaded, 8 threads, 20000 ops each)
-  put (worst thread): 748 ms  (26738 ops/sec/thread)
-  get (worst thread): 90 ms  (222222 ops/sec/thread)
-  total wall time (put+get): 764 ms  (418848 ops/sec total)
+DKV (multithreaded, 20 threads, 200000 ops each)
+  put (worst thread): 7788 ms  (25680.5 ops/sec/thread)
+  get (worst thread): 347 ms  (576369 ops/sec/thread)
+  total wall time (put+get): 8120 ms  (985222 ops/sec total)
 
 SQLite (txn + prepared statements)
-   put:    194 ms  (515464 ops/sec)
-   get:    267 ms  (374532 ops/sec)
-   update: 192 ms  (520833 ops/sec)
-   delete: 104 ms  (961538 ops/sec)
+   put:    1430 ms  (699301 ops/sec)
+   get:    2832 ms  (353107 ops/sec)
+   update: 1996 ms  (501002 ops/sec)
+   delete: 1244 ms  (803859 ops/sec)
 
-SQLite (multithreaded, 8 threads, 20000 ops each)
-  put (worst thread): 888 ms  (22522.5 ops/sec/thread)
-  get (worst thread): 89 ms  (224719 ops/sec/thread)
-  total wall time (put+get): 1044 ms  (306513 ops/sec total)
+SQLite (multithreaded, 20 threads, 200000 ops each)
+  put (worst thread): 10382 ms  (19264.1 ops/sec/thread)
+  get (worst thread): 744 ms  (268817 ops/sec/thread)
+  total wall time (put+get): 11155 ms  (717167 ops/sec total)
 ```
