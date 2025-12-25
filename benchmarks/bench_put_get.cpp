@@ -12,9 +12,17 @@
 #ifndef DKV_HAVE_SQLITE
 #define DKV_HAVE_SQLITE 0
 #endif
+#ifndef DKV_HAVE_LEVELDB
+#define DKV_HAVE_LEVELDB 0
+#endif
 
 #if DKV_HAVE_SQLITE
 #include <sqlite3.h>
+#endif
+#if DKV_HAVE_LEVELDB
+#include <leveldb/db.h>
+#include <leveldb/options.h>
+#include <leveldb/write_batch.h>
 #endif
 
 namespace {
@@ -261,6 +269,187 @@ CrudStats BenchDKVMultithread(std::size_t n_threads, std::size_t ops_per_thread)
   return stats;
 }
 
+#if DKV_HAVE_LEVELDB
+CrudStats BenchLevelDB(std::size_t n, std::size_t batch_size) {
+  CrudStats stats;
+  auto dir = TempDir("leveldb-bench");
+
+  leveldb::Options opts;
+  opts.create_if_missing = true;
+  opts.compression = leveldb::kNoCompression;
+  opts.block_size = 16 * 1024;
+  opts.write_buffer_size = 1024 * 1024 * 1024;  // match DKV memtable limit used here
+  opts.max_open_files = 1000;
+  std::unique_ptr<leveldb::DB> db;
+  {
+    leveldb::DB* raw = nullptr;
+    auto s = leveldb::DB::Open(opts, dir.string(), &raw);
+    if (!s.ok()) {
+      std::cerr << "open leveldb: " << s.ToString() << "\n";
+      std::exit(1);
+    }
+    db.reset(raw);
+  }
+
+  auto keys = Keys(n);
+  dkv::WriteOptions wopts;
+
+  leveldb::WriteOptions lw;
+  lw.sync = false;
+
+  auto start_put = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < n; i += batch_size) {
+    leveldb::WriteBatch batch;
+    for (std::size_t j = i; j < std::min(n, i + batch_size); ++j) {
+      batch.Put(keys[j], "v" + std::to_string(j));
+    }
+    auto s = db->Write(lw, &batch);
+    if (!s.ok()) {
+      std::cerr << "leveldb batch put: " << s.ToString() << "\n";
+      std::exit(1);
+    }
+  }
+  stats.put_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start_put)
+                     .count();
+
+  std::string value;
+  auto start_get = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < n; ++i) {
+    auto s = db->Get(leveldb::ReadOptions(), keys[i], &value);
+    if (!s.ok()) {
+      std::cerr << "leveldb get: " << s.ToString() << "\n";
+      std::exit(1);
+    }
+  }
+  stats.get_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - start_get)
+                     .count();
+
+  auto start_update = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < n; i += batch_size) {
+    leveldb::WriteBatch batch;
+    for (std::size_t j = i; j < std::min(n, i + batch_size); ++j) {
+      batch.Put(keys[j], "u" + std::to_string(j));
+    }
+    auto s = db->Write(lw, &batch);
+    if (!s.ok()) {
+      std::cerr << "leveldb batch update: " << s.ToString() << "\n";
+      std::exit(1);
+    }
+  }
+  stats.update_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start_update)
+                        .count();
+
+  auto start_delete = std::chrono::steady_clock::now();
+  for (std::size_t i = 0; i < n; i += batch_size) {
+    leveldb::WriteBatch batch;
+    for (std::size_t j = i; j < std::min(n, i + batch_size); ++j) {
+      batch.Delete(keys[j]);
+    }
+    auto s = db->Write(lw, &batch);
+    if (!s.ok()) {
+      std::cerr << "leveldb batch delete: " << s.ToString() << "\n";
+      std::exit(1);
+    }
+  }
+  stats.delete_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start_delete)
+                        .count();
+
+  db.reset();
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return stats;
+}
+
+CrudStats BenchLevelDBMultithread(std::size_t n_threads, std::size_t ops_per_thread) {
+  CrudStats stats;
+  auto dir = TempDir("leveldb-bench-mt");
+
+  leveldb::Options opts;
+  opts.create_if_missing = true;
+  opts.compression = leveldb::kNoCompression;
+  opts.block_size = 16 * 1024;
+  opts.write_buffer_size = 1024 * 1024 * 1024;
+  opts.max_open_files = 1000;
+  std::unique_ptr<leveldb::DB> db;
+  {
+    leveldb::DB* raw = nullptr;
+    auto s = leveldb::DB::Open(opts, dir.string(), &raw);
+    if (!s.ok()) {
+      std::cerr << "open leveldb mt: " << s.ToString() << "\n";
+      std::exit(1);
+    }
+    db.reset(raw);
+  }
+
+  auto worker = [&](std::size_t tid, std::size_t count, double& put_ms, double& get_ms) {
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      keys.push_back("t" + std::to_string(tid) + "-k" + std::to_string(i));
+    }
+    leveldb::WriteOptions lw;
+    lw.sync = false;
+
+    auto start_put = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < count; ++i) {
+      auto s = db->Put(lw, keys[i], "v" + std::to_string(i));
+      if (!s.ok()) {
+        std::cerr << "leveldb mt put: " << s.ToString() << "\n";
+        std::exit(1);
+      }
+    }
+    put_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_put)
+                 .count();
+
+    std::string value;
+    auto start_get = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < count; ++i) {
+      auto s = db->Get(leveldb::ReadOptions(), keys[i], &value);
+      if (!s.ok()) {
+        std::cerr << "leveldb mt get: " << s.ToString() << "\n";
+        std::exit(1);
+      }
+    }
+    get_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start_get)
+                 .count();
+  };
+
+  std::vector<std::thread> threads;
+  std::vector<double> put_times(n_threads, 0.0);
+  std::vector<double> get_times(n_threads, 0.0);
+
+  auto start_all = std::chrono::steady_clock::now();
+  for (std::size_t t = 0; t < n_threads; ++t) {
+    threads.emplace_back(worker, t, ops_per_thread, std::ref(put_times[t]), std::ref(get_times[t]));
+  }
+  for (auto& th : threads) th.join();
+  auto elapsed_total =
+      std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start_all)
+          .count();
+
+  double worst_put_ms = 0, worst_get_ms = 0;
+  for (std::size_t i = 0; i < n_threads; ++i) {
+    worst_put_ms = std::max(worst_put_ms, put_times[i]);
+    worst_get_ms = std::max(worst_get_ms, get_times[i]);
+  }
+  stats.put_ms = worst_put_ms;
+  stats.get_ms = worst_get_ms;
+  stats.update_ms = elapsed_total;
+  stats.delete_ms = 0;
+
+  db.reset();
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+  return stats;
+}
+#endif  // DKV_HAVE_LEVELDB
+
 #if DKV_HAVE_SQLITE
 // Forward declarations for helpers defined below.
 bool CheckSQLite(int rc, sqlite3* db, const char* msg);
@@ -474,8 +663,8 @@ void PrintStats(const std::string& label, std::size_t n, const CrudStats& s) {
 }  // namespace
 
 int main() {
-  const std::size_t kN = 100000000;
-  const std::size_t kBatch = 500000;
+  const std::size_t kN = 1000000;
+  const std::size_t kBatch = 5000;
   const std::size_t kThreads = 20;
   const std::size_t kOpsPerThread = 200000;
 
@@ -513,6 +702,22 @@ int main() {
             << OpsPerSec(kThreads * kOpsPerThread * 2, sqlite_mt.update_ms) << " ops/sec total)\n";
 #else
   std::cout << "\nSQLite bench skipped (DKV_HAVE_SQLITE=0)\n";
+#endif
+#if DKV_HAVE_LEVELDB
+  auto leveldb_stats = BenchLevelDB(kN, kBatch);
+  std::cout << "\nLevelDB (batched writes, batch size " << kBatch << ")\n";
+  PrintStats("  ", kN, leveldb_stats);
+
+  auto leveldb_mt = BenchLevelDBMultithread(kThreads, kOpsPerThread);
+  std::cout << "\nLevelDB (multithreaded, " << kThreads << " threads, " << kOpsPerThread << " ops each)\n";
+  std::cout << "  put (worst thread): " << leveldb_mt.put_ms << " ms  ("
+            << OpsPerSec(kOpsPerThread, leveldb_mt.put_ms) << " ops/sec/thread)\n";
+  std::cout << "  get (worst thread): " << leveldb_mt.get_ms << " ms  ("
+            << OpsPerSec(kOpsPerThread, leveldb_mt.get_ms) << " ops/sec/thread)\n";
+  std::cout << "  total wall time (put+get): " << leveldb_mt.update_ms << " ms  ("
+            << OpsPerSec(kThreads * kOpsPerThread * 2, leveldb_mt.update_ms) << " ops/sec total)\n";
+#else
+  std::cout << "\nLevelDB bench skipped (DKV_HAVE_LEVELDB=0)\n";
 #endif
 
   return 0;

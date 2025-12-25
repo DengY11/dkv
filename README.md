@@ -56,32 +56,44 @@ See `docs/` for design notes and tuning tips.
 
 ## Benchmark (DKV vs Sqlite)
 ```bash
-Benchmarking 100000000 ops
-DKV (single ops)
-   put:    127164 ms  (786386 ops/sec)
-   get:    50640 ms  (1.97472e+06 ops/sec)
-   update: 134503 ms  (743478 ops/sec)
-   delete: 132494 ms  (754751 ops/sec)
+Benchmarking 1000000 ops
 
-DKV (batched writes, batch size 500000)
-   put:    131865 ms  (758351 ops/sec)
-   get:    61137 ms  (1.63567e+06 ops/sec)
-   update: 144900 ms  (690131 ops/sec)
-   delete: 143276 ms  (697954 ops/sec)
+DKV (single ops)
+   put:    929 ms  (1.07643e+06 ops/sec)
+   get:    261 ms  (3.83142e+06 ops/sec)
+   update: 613 ms  (1.63132e+06 ops/sec)
+   delete: 553 ms  (1.80832e+06 ops/sec)
+
+DKV (batched writes, batch size 5000)
+   put:    893 ms  (1.11982e+06 ops/sec)
+   get:    308 ms  (3.24675e+06 ops/sec)
+   update: 644 ms  (1.5528e+06 ops/sec)
+   delete: 583 ms  (1.71527e+06 ops/sec)
 
 DKV (multithreaded, 20 threads, 200000 ops each)
-  put (worst thread): 7863 ms  (25435.6 ops/sec/thread)
-  get (worst thread): 362 ms  (552486 ops/sec/thread)
-  total wall time (put+get): 8201 ms  (975491 ops/sec total)
+  put (worst thread): 7670 ms  (26075.6 ops/sec/thread)
+  get (worst thread): 370 ms  (540541 ops/sec/thread)
+  total wall time (put+get): 8003 ms  (999625 ops/sec total)
 
 SQLite (txn + prepared statements)
-   put:    165597 ms  (603876 ops/sec)
-   get:    304237 ms  (328691 ops/sec)
-   update: 271286 ms  (368615 ops/sec)
-   delete: 162341 ms  (615987 ops/sec)
+   put:    1442 ms  (693481 ops/sec)
+   get:    2700 ms  (370370 ops/sec)
+   update: 2016 ms  (496032 ops/sec)
+   delete: 1217 ms  (821693 ops/sec)
 
 SQLite (multithreaded, 20 threads, 200000 ops each)
-  put (worst thread): 10491 ms  (19064 ops/sec/thread)
-  get (worst thread): 744 ms  (268817 ops/sec/thread)
-  total wall time (put+get): 11238 ms  (711870 ops/sec total)
+  put (worst thread): 10422 ms  (19190.2 ops/sec/thread)
+  get (worst thread): 679 ms  (294551 ops/sec/thread)
+  total wall time (put+get): 11143 ms  (717940 ops/sec total)
+
+LevelDB (batched writes, batch size 5000)
+   put:    870 ms  (1.14943e+06 ops/sec)
+   get:    1270 ms  (787402 ops/sec)
+   update: 808 ms  (1.23762e+06 ops/sec)
+   delete: 1438 ms  (695410 ops/sec)
+
+LevelDB (multithreaded, 20 threads, 200000 ops each)
+  put (worst thread): 26436 ms  (7565.44 ops/sec/thread)
+  get (worst thread): 5527 ms  (36186 ops/sec/thread)
+  total wall time (put+get): 31972 ms  (250219 ops/sec total)
 ```
