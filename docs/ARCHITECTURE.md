@@ -1,13 +1,13 @@
 # Architecture and Tuning
 
-`dkv` is a minimal LSM-tree store with durability (WAL + fsync), CRC protection, a manifest for crash recovery, and basic metrics for observability. Code is intentionally compact (~2k LOC) to make it easy to extend.
+`dkv` is a minimal LSM-tree store with durability (WAL + fsync), CRC protection, a manifest for crash recovery, dual memtables with background flush, and basic metrics for observability. Code is intentionally compact to make it easy to extend.
 
 ## Components
-- **Memtable (`src/memtable.*`)**: in-memory sorted map on `std::pmr::map` + arena to reduce allocations. Tracks approximate memory footprint to trigger flush. Supports `Put/Delete/Get/Snapshot`.
-- **WAL (`src/wal.*`)**: append-only log with per-record CRC32. Optional per-write fsync, background periodic sync, and parent-dir fsync on reset. Replay stops at first corrupted record to avoid applying garbage.
+- **Memtable (`src/memtable.*`)**: in-memory sorted map on `std::pmr::map` + arena to reduce allocations. Tracks approximate memory footprint to trigger flush. Supports `Put/Delete/Get/Snapshot`. Two memtables are in flight: an active one for writes and a queue of immutables flushed by a background thread.
+- **WAL (`src/wal.*`)**: append-only log with per-record CRC32. Optional per-write fsync, background periodic sync, and parent-dir fsync on reset/rotation. Replay stops at the first corrupted record to avoid applying garbage. WAL rotates to `wal-<max_seq>.log` when memtable is sealed.
 - **SSTable (`src/sstable.*`)**: immutable sorted run. Entries encoded as `[deleted byte][seq][klen][vlen][key][value]`. Data is block-organized with sparse block index and a Bloom filter; footer stores offsets and magic. Block cache is optional (`block_cache_capacity_bytes`).
-- **Manifest (`data_dir/MANIFEST`)**: records the active SSTables and their levels. Written atomically via temp file + fsync file + fsync parent dir + rename. Startup prefers manifest; falls back to directory scan if absent.
-- **DB (`src/db.*`)**: orchestrates WAL, memtable, SSTables. Flush writes the memtable to a new L0 SST and truncates WAL. Leveled compaction merges L0 into L1+ maintaining non-overlapping key ranges for L1+.
+- **Manifest (`data_dir/MANIFEST`)**: records the active SSTables and their levels. Written atomically via temp file + fsync file + fsync parent dir + rename. Startup prefers manifest; falls back to directory scan if absent. Recovery replays all `wal-*.log` segments plus `wal.log` in sequence order.
+- **DB (`src/db.*`)**: orchestrates WAL, memtables, SSTables. When the active memtable exceeds `memtable_soft_limit_bytes`, it is swapped into the immutable queue, WAL is rotated, and a background thread flushes immutables to L0 SSTables and deletes their WAL segments. Leveled compaction merges L0 into L1+ maintaining non-overlapping key ranges for L1+.
 - **Metrics**: cumulative counters for puts/deletes/gets/batches, flush/compaction counts, durations, bytes, and WAL syncs (`DB::GetMetrics`).
 
 ## File Layout
@@ -18,18 +18,19 @@
 ## Write Path
 1. Assign monotonically increasing sequence.
 2. Append to WAL (CRC protected). If `sync_wal` or `WriteOptions::sync`, fsync immediately.
-3. Apply to memtable (pmr map).
-4. If memtable exceeds `memtable_soft_limit_bytes`, flush to a new L0 SST, truncate WAL, write manifest.
+3. Apply to active memtable (pmr map).
+4. If memtable exceeds `memtable_soft_limit_bytes`, rotate WAL to `wal-<max_seq>.log`, move the active memtable into the immutable queue, create a fresh active memtable, let the background thread flush immutables to L0 and delete their WAL segments, and rewrite manifest.
 
 `WriteBatch` groups multiple ops under one WAL sync, reducing fsync overhead while remaining atomic at the DB level.
 
 Background WAL sync: if `wal_sync_interval_ms > 0` and `sync_wal==false`, a thread calls `wal_->Sync(false)` periodically; manual sync via `WriteOptions::sync` still forces fsync.
 
 ## Read Path
-1. Check memtable.
-2. Check L0 SSTables newest-first (may overlap).
-3. Check L1+ using key ranges + Bloom to prune (non-overlapping per level).
-4. `Scan` merges the latest version per key across memtable and SSTables (in-memory merge for simplicity).
+1. Check active memtable.
+2. Check immutable memtables in the flush queue (newer to older).
+3. Check L0 SSTables newest-first (may overlap).
+4. Check L1+ using key ranges + Bloom to prune (non-overlapping per level).
+5. `Scan` merges the latest version per key across memtables and SSTables (in-memory merge for simplicity).
 
 ## Compaction
 - Triggered when L0 file count exceeds `level0_file_limit`, or when `LevelBytes(level) > LevelMaxBytes(level)` for L1+ (`level_base_bytes * level_size_multiplier^(level-1)`).
@@ -38,9 +39,9 @@ Background WAL sync: if `wal_sync_interval_ms > 0` and `sync_wal==false`, a thre
 - Cleanup: delete old SSTs, insert new ones, rewrite manifest, update metrics (count/duration/input+output bytes).
 
 ## Durability and Integrity
-- WAL records carry CRC32; replay verifies and stops at first bad record.
+- WAL records carry CRC32; replay verifies and stops at the first bad record.
 - Manifest is fsynced (file + parent dir) to persist the set of live SSTables.
-- WAL reset fsyncs parent dir to persist the truncated file entry.
+- WAL segments are rotated and deleted after successful flush; rotation fsyncs parent dir to persist directory entries.
 - SSTable footer carries magic/offsets; Bloom/index are read bounds-checked.
 
 ## Metrics (DB::GetMetrics)
