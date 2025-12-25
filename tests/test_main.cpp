@@ -4,6 +4,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "dkv/db.h"
@@ -133,6 +134,86 @@ bool TestBatchWrite() {
   return true;
 }
 
+std::string RandomString(std::mt19937_64& rng, std::size_t len) {
+  static const char kChars[] =
+      "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  std::uniform_int_distribution<std::size_t> dist(0, sizeof(kChars) - 2);
+  std::string s;
+  s.reserve(len);
+  for (std::size_t i = 0; i < len; ++i) s.push_back(kChars[dist(rng)]);
+  return s;
+}
+
+bool TestFuzzAgainstModel() {
+  auto dir = TempDir("dkv-fuzz");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 256 * 1024;
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db")) return false;
+
+  std::mt19937_64 rng(123456789);
+  std::uniform_int_distribution<int> op_dist(0, 2);  // 0=put,1=del,2=get
+  std::uniform_int_distribution<int> key_len_dist(4, 16);
+  std::uniform_int_distribution<int> val_len_dist(1, 32);
+
+  // Model: key -> optional value (empty string represents tombstone)
+  std::unordered_map<std::string, std::string> model;
+  std::vector<std::string> key_space;
+  key_space.reserve(200);
+  for (int i = 0; i < 200; ++i) key_space.push_back(RandomString(rng, 8));
+  std::uniform_int_distribution<std::size_t> key_pick(0, key_space.size() - 1);
+
+  dkv::WriteOptions wopts;
+  dkv::ReadOptions ropts;
+
+  const int kOps = 5000;
+  for (int i = 0; i < kOps; ++i) {
+    const std::string& key = key_space[key_pick(rng)];
+    int op = op_dist(rng);
+    if (op == 0) {  // put
+      std::string value = RandomString(rng, static_cast<std::size_t>(val_len_dist(rng)));
+      if (!ExpectOk(db->Put(wopts, key, value), "fuzz put")) return false;
+      model[key] = value;
+    } else if (op == 1) {  // delete
+      if (!ExpectOk(db->Delete(wopts, key), "fuzz delete")) return false;
+      model.erase(key);
+    } else {  // get
+      std::string value;
+      auto s = db->Get(ropts, key, value);
+      auto it = model.find(key);
+      if (it == model.end()) {
+        if (s.ok()) {
+          std::cerr << "fuzz get expected not found for key=" << key << "\n";
+          return false;
+        }
+      } else {
+        if (!s.ok() || value != it->second) {
+          std::cerr << "fuzz get mismatch for key=" << key << " expected=" << it->second
+                    << " got=" << value << " status=" << s.ToString() << "\n";
+          return false;
+        }
+      }
+    }
+
+    // Occasionally flush/compact to exercise persistence path.
+    if (i % 500 == 499) {
+      if (!ExpectOk(db->Flush(), "fuzz flush")) return false;
+      if (!ExpectOk(db->Compact(), "fuzz compact")) return false;
+    }
+  }
+
+  // Final verification: full scan of model keys.
+  for (const auto& kv : model) {
+    std::string value;
+    if (!ExpectOk(db->Get(ropts, kv.first, value), "final get")) return false;
+    assert(value == kv.second);
+  }
+
+  std::filesystem::remove_all(dir);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -141,6 +222,7 @@ int main() {
   ok &= TestFlushAndRecover();
   ok &= TestCompaction();
   ok &= TestBatchWrite();
+   ok &= TestFuzzAgainstModel();
   if (!ok) {
     std::cerr << "Tests failed\n";
     return 1;

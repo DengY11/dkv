@@ -65,10 +65,15 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len) {
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
           .count();
 
-  double ops_sec = (elapsed_ms > 0) ? static_cast<double>(n) / (elapsed_ms / 1000.0) : 0.0;
+  double secs = (elapsed_ms > 0) ? (elapsed_ms / 1000.0) : 0.0;
+  double ops_sec = (secs > 0) ? static_cast<double>(n) / secs : 0.0;
+  // Payload MB/s: only key+value bytes (no headers), base 1 MB = 1e6 bytes.
+  double payload_bytes = static_cast<double>(n) * (key_len + value_len);
+  double payload_mb_s = (secs > 0) ? (payload_bytes / 1e6) / secs : 0.0;
   std::cout << "Put " << n << " entries "
             << "(key_len=" << key_len << ", value_len=" << value_len << "): "
-            << elapsed_ms << " ms, " << ops_sec << " ops/sec\n";
+            << elapsed_ms << " ms, " << ops_sec << " ops/sec, "
+            << payload_mb_s << " MB/s payload\n";
 
   std::error_code ec;
   std::filesystem::remove_all(dir, ec);
