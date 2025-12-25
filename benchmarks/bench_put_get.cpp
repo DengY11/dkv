@@ -61,7 +61,7 @@ CrudStats BenchDKVSingle(std::size_t n) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 16 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 1024 * 1024 * 1024;
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
@@ -120,7 +120,7 @@ CrudStats BenchDKVBatch(std::size_t n, std::size_t batch_size) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 16 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 1024 * 1024 * 1024;
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
@@ -474,7 +474,7 @@ void PrintStats(const std::string& label, std::size_t n, const CrudStats& s) {
 
 int main() {
   const std::size_t kN = 1000000;
-  const std::size_t kBatch = 50000;
+  const std::size_t kBatch = 5000;
   const std::size_t kThreads = 20;
   const std::size_t kOpsPerThread = 200000;
 

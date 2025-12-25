@@ -29,6 +29,8 @@ struct Options {
   std::size_t wal_sync_interval_ms{0};
   // Enable CRC32 for WAL records. Disable for performance experiments only.
   bool enable_crc{true};
+  // Number of shards in memtable for concurrency (power of two recommended).
+  std::size_t memtable_shard_count{16};
 };
 
 struct WriteOptions {

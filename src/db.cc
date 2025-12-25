@@ -31,7 +31,7 @@ class DB::Impl {
         data_dir_(options_.data_dir),
         wal_path_(data_dir_ / "wal.log"),
         sst_dir_(data_dir_ / "sst"),
-        mem_(std::make_unique<MemTable>()) {}
+        mem_(std::make_unique<MemTable>(options_.memtable_shard_count)) {}
   ~Impl();
 
   Status Init();
@@ -85,8 +85,8 @@ class DB::Impl {
   bool stop_flush_{false};
   std::shared_ptr<BlockCache> block_cache_;
 
-  std::mutex mu_;  // guards mem_, wal_ operations, seq_ and flush/compaction exclusivity.
-  std::uint64_t next_seq_{1};
+  std::shared_mutex mu_;  // shared for reads/writes; unique for flush/compaction/wal rotation.
+  std::atomic<std::uint64_t> next_seq_{1};
 
   std::thread wal_sync_thread_;
   std::condition_variable wal_sync_cv_;
@@ -172,7 +172,7 @@ Status DB::Impl::Init() {
     }
   }
 
-  next_seq_ = max_seq_seen + 1;
+  next_seq_.store(max_seq_seen + 1, std::memory_order_relaxed);
   if (options_.block_cache_capacity_bytes > 0) {
     block_cache_ = std::make_shared<BlockCache>(options_.block_cache_capacity_bytes);
   }
@@ -271,56 +271,66 @@ Status DB::Impl::LoadSSTables() {
 }
 
 Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string value) {
-  std::lock_guard lock(mu_);
+  std::shared_lock shared(mu_);
   metrics_.puts.fetch_add(1, std::memory_order_relaxed);
-  const std::uint64_t seq = next_seq_++;
+  const std::uint64_t seq = next_seq_.fetch_add(1, std::memory_order_relaxed);
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendPut(seq, key, value, sync_now);
   if (!s.ok()) return s;
   s = mem_->Put(seq, key, value);
   if (!s.ok()) return s;
   if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
-  if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-    auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>();
-    std::filesystem::path rotated;
-    s = RotateWalLocked(seq, rotated);
-    if (!s.ok()) return s;
-    EnqueueImmutable(std::move(imm_mem), seq, rotated);
+  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
+  shared.unlock();
+  if (need_rotate) {
+    std::unique_lock lk(mu_);
+    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
+      auto imm_mem = std::move(mem_);
+      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count);
+      std::filesystem::path rotated;
+      s = RotateWalLocked(seq, rotated);
+      if (!s.ok()) return s;
+      EnqueueImmutable(std::move(imm_mem), seq, rotated);
+    }
   }
   return Status::OK();
 }
 
 Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
-  std::lock_guard lock(mu_);
+  std::shared_lock shared(mu_);
   metrics_.deletes.fetch_add(1, std::memory_order_relaxed);
-  const std::uint64_t seq = next_seq_++;
+  const std::uint64_t seq = next_seq_.fetch_add(1, std::memory_order_relaxed);
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendDelete(seq, key, sync_now);
   if (!s.ok()) return s;
   s = mem_->Delete(seq, key);
   if (!s.ok()) return s;
   if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
-  if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-    auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>();
-    std::filesystem::path rotated;
-    s = RotateWalLocked(seq, rotated);
-    if (!s.ok()) return s;
-    EnqueueImmutable(std::move(imm_mem), seq, rotated);
+  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
+  shared.unlock();
+  if (need_rotate) {
+    std::unique_lock lk(mu_);
+    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
+      auto imm_mem = std::move(mem_);
+      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count);
+      std::filesystem::path rotated;
+      s = RotateWalLocked(seq, rotated);
+      if (!s.ok()) return s;
+      EnqueueImmutable(std::move(imm_mem), seq, rotated);
+    }
   }
   return Status::OK();
 }
 
 Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
   if (batch.empty()) return Status::OK();
-  std::lock_guard lock(mu_);
+  std::shared_lock shared(mu_);
   metrics_.batches.fetch_add(1, std::memory_order_relaxed);
   std::vector<std::uint64_t> seqs;
   seqs.reserve(batch.ops().size());
 
   for (std::size_t i = 0; i < batch.ops().size(); ++i) {
-    seqs.push_back(next_seq_++);
+    seqs.push_back(next_seq_.fetch_add(1, std::memory_order_relaxed));
   }
 
   for (std::size_t i = 0; i < batch.ops().size(); ++i) {
@@ -346,13 +356,18 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
     if (!s.ok()) return s;
   }
 
-  if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-    auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>();
-    std::filesystem::path rotated;
-    Status s = RotateWalLocked(seqs.back(), rotated);
-    if (!s.ok()) return s;
-    EnqueueImmutable(std::move(imm_mem), seqs.back(), rotated);
+  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
+  shared.unlock();
+  if (need_rotate) {
+    std::unique_lock lk(mu_);
+    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
+      auto imm_mem = std::move(mem_);
+      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count);
+      std::filesystem::path rotated;
+      Status s = RotateWalLocked(seqs.back(), rotated);
+      if (!s.ok()) return s;
+      EnqueueImmutable(std::move(imm_mem), seqs.back(), rotated);
+    }
   }
   return Status::OK();
 }
@@ -432,7 +447,7 @@ Status DB::Impl::Scan(const ReadOptions& /*options*/, std::string_view from, std
 }
 
 Status DB::Impl::Flush() {
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
   Status s = FlushLocked();
   if (!s.ok()) return s;
   return MaybeCompactLocked();
@@ -444,7 +459,8 @@ Status DB::Impl::FlushLocked() {
     auto imm_mem = std::move(mem_);
     mem_ = std::make_unique<MemTable>();
     std::filesystem::path rotated;
-    std::uint64_t max_seq = next_seq_ ? next_seq_ - 1 : 0;
+    auto cur = next_seq_.load(std::memory_order_relaxed);
+    std::uint64_t max_seq = cur ? cur - 1 : 0;
     Status s = RotateWalLocked(max_seq, rotated);
     if (!s.ok()) return s;
     EnqueueImmutable(std::move(imm_mem), max_seq, rotated);
@@ -832,7 +848,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
 }
 
 Status DB::Impl::Compact() {
-  std::lock_guard lock(mu_);
+  std::unique_lock lock(mu_);
   // Flush memtable first to simplify compaction.
   Status s = FlushLocked();
   if (!s.ok()) return s;
