@@ -18,6 +18,7 @@
 #include <atomic>
 
 #include "block_cache.h"
+#include "bloom_cache.h"
 #include "memtable.h"
 #include "sstable.h"
 #include "wal.h"
@@ -84,6 +85,7 @@ class DB::Impl {
   std::mutex flush_mu_;
   bool stop_flush_{false};
   std::shared_ptr<BlockCache> block_cache_;
+  std::shared_ptr<BloomCache> bloom_cache_;
 
   std::shared_mutex mu_;  // shared for reads/writes; unique for flush/compaction/wal rotation.
   std::atomic<std::uint64_t> next_seq_{1};
@@ -176,6 +178,9 @@ Status DB::Impl::Init() {
   if (options_.block_cache_capacity_bytes > 0) {
     block_cache_ = std::make_shared<BlockCache>(options_.block_cache_capacity_bytes);
   }
+  if (options_.bloom_cache_capacity_bytes > 0) {
+    bloom_cache_ = std::make_shared<BloomCache>(options_.bloom_cache_capacity_bytes);
+  }
   StartWalSyncThread();
   stop_flush_ = false;
   flush_thread_ = std::thread([this] { FlushThreadLoop(); });
@@ -247,7 +252,8 @@ Status DB::Impl::LoadSSTables() {
       std::size_t level = 0;
       if (!parse_level(entry.path().filename().string(), level)) continue;
       std::shared_ptr<SSTable> table;
-      Status s = SSTable::Open(entry.path(), block_cache_, table);
+      bool pin_bloom = level > 0;
+      Status s = SSTable::Open(entry.path(), block_cache_, bloom_cache_, pin_bloom, table);
       if (!s.ok()) return s;
       ensure_level(level);
       loaded[level].push_back(TableRef{table, table->min_key(), table->max_key(), table->file_size()});
@@ -550,7 +556,8 @@ Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
     }
     auto path = data_dir_ / path_str;
     std::shared_ptr<SSTable> table;
-    Status s = SSTable::Open(path, block_cache_, table);
+    bool pin_bloom = level > 0;
+    Status s = SSTable::Open(path, block_cache_, bloom_cache_, pin_bloom, table);
     if (!s.ok()) return s;
     ensure_level(level);
     loaded[level].push_back(TableRef{table, min_key, max_key, size == 0 ? table->file_size() : size});
@@ -656,7 +663,7 @@ Status DB::Impl::FlushImmutable(const ImmutableMem& imm) {
   if (!s.ok()) return s;
 
   std::shared_ptr<SSTable> table;
-  s = SSTable::Open(path, block_cache_, table);
+  s = SSTable::Open(path, block_cache_, bloom_cache_, false, table);
   if (!s.ok()) return s;
 
   {
@@ -785,7 +792,8 @@ Status DB::Impl::CompactLevel(std::size_t level) {
                                  options_.bloom_bits_per_key);
       if (!ws.ok()) return ws;
       std::shared_ptr<SSTable> t;
-      ws = SSTable::Open(path, block_cache_, t);
+      bool pin_bloom = target_level > 0;
+      ws = SSTable::Open(path, block_cache_, bloom_cache_, pin_bloom, t);
       if (!ws.ok()) return ws;
       out_tables.push_back(TableRef{t, t->min_key(), t->max_key(), t->file_size()});
       chunk_data.clear();

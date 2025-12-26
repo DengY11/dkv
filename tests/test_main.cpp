@@ -214,6 +214,114 @@ bool TestFuzzAgainstModel() {
   return true;
 }
 
+bool TestFuzzWithReopen() {
+  auto dir = TempDir("dkv-fuzz-reopen");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 64 * 1024;  // trigger flushes
+  opts.sync_wal = false;
+  opts.wal_sync_interval_ms = 0;
+
+  std::mt19937_64 rng(424242);
+  std::uniform_int_distribution<int> op_dist(0, 2);   // 0=put,1=del,2=get
+  std::uniform_int_distribution<int> key_len_dist(4, 12);
+  std::uniform_int_distribution<int> val_len_dist(1, 24);
+
+  // Persistent model across reopen.
+  std::unordered_map<std::string, std::string> model;
+  std::vector<std::string> key_space;
+  key_space.reserve(256);
+  for (int i = 0; i < 256; ++i) key_space.push_back(RandomString(rng, static_cast<std::size_t>(key_len_dist(rng))));
+  std::uniform_int_distribution<std::size_t> key_pick(0, key_space.size() - 1);
+
+  auto run_round = [&](int round_ops, int round_idx) -> bool {
+    std::unique_ptr<dkv::DB> db;
+    if (!ExpectOk(dkv::DB::Open(opts, db), "open db round " + std::to_string(round_idx))) return false;
+    dkv::WriteOptions wopts;
+    dkv::ReadOptions ropts;
+
+    for (int i = 0; i < round_ops; ++i) {
+      const std::string& key = key_space[key_pick(rng)];
+      int op = op_dist(rng);
+      if (op == 0) {
+        std::string value = RandomString(rng, static_cast<std::size_t>(val_len_dist(rng)));
+        if (!ExpectOk(db->Put(wopts, key, value), "fuzz reopen put")) return false;
+        model[key] = value;
+      } else if (op == 1) {
+        if (!ExpectOk(db->Delete(wopts, key), "fuzz reopen delete")) return false;
+        model.erase(key);
+      } else {
+        std::string value;
+        auto s = db->Get(ropts, key, value);
+        auto it = model.find(key);
+        if (it == model.end()) {
+          if (s.ok()) {
+            std::cerr << "fuzz reopen get expected miss key=" << key << "\n";
+            return false;
+          }
+        } else if (!s.ok() || value != it->second) {
+          std::cerr << "fuzz reopen get mismatch key=" << key << " expected=" << it->second
+                    << " got=" << value << " status=" << s.ToString() << "\n";
+          return false;
+        }
+      }
+
+      if (i % 200 == 199) {
+        if (!ExpectOk(db->Flush(), "fuzz reopen flush")) return false;
+        if (!ExpectOk(db->Compact(), "fuzz reopen compact")) return false;
+      }
+    }
+
+    // Verify a sample before closing.
+    for (int j = 0; j < 10; ++j) {
+      const std::string& key = key_space[key_pick(rng)];
+      std::string value;
+      auto s = db->Get(ropts, key, value);
+      auto it = model.find(key);
+      if (it == model.end()) {
+        if (s.ok()) {
+          std::cerr << "fuzz reopen pre-close expected miss key=" << key << "\n";
+          return false;
+        }
+      } else if (!s.ok() || value != it->second) {
+        std::cerr << "fuzz reopen pre-close mismatch key=" << key << " expected=" << it->second
+                  << " got=" << value << " status=" << s.ToString() << "\n";
+        return false;
+      }
+    }
+
+    db.reset();  // force reopen next round
+    return true;
+  };
+
+  // multiple rounds with reopen between
+  for (int round = 0; round < 3; ++round) {
+    if (!run_round(800, round)) {
+      std::filesystem::remove_all(dir);
+      return false;
+    }
+  }
+
+  // Final full validation after last reopen
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db final verify")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  dkv::ReadOptions ropts;
+  for (const auto& kv : model) {
+    std::string value;
+    if (!ExpectOk(db->Get(ropts, kv.first, value), "final verify get")) {
+      std::filesystem::remove_all(dir);
+      return false;
+    }
+    assert(value == kv.second);
+  }
+
+  std::filesystem::remove_all(dir);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -222,7 +330,8 @@ int main() {
   ok &= TestFlushAndRecover();
   ok &= TestCompaction();
   ok &= TestBatchWrite();
-   ok &= TestFuzzAgainstModel();
+  ok &= TestFuzzAgainstModel();
+  ok &= TestFuzzWithReopen();
   if (!ok) {
     std::cerr << "Tests failed\n";
     return 1;

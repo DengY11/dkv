@@ -10,19 +10,21 @@
 #include <vector>
 
 #include "block_cache.h"
+#include "bloom_cache.h"
 #include "memtable.h"
 #include "bloom.h"
 #include "util.h"
 
 namespace dkv {
 
- class SSTable {
+class SSTable {
  public:
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
                      std::size_t block_size, std::size_t bloom_bits_per_key);
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
                      std::size_t block_size, std::size_t bloom_bits_per_key);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
+                    const std::shared_ptr<BloomCache>& bloom_cache, bool pin_bloom,
                     std::shared_ptr<SSTable>& out);
 
   bool Get(std::string_view key, MemEntry& entry) const;
@@ -42,9 +44,12 @@ namespace dkv {
     std::uint64_t offset{0};
   };
 
-  SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, BloomFilter bloom,
-          std::string min_key, std::string max_key, std::uint64_t max_seq,
-          std::uint64_t file_size, std::uint64_t bloom_start);
+  SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, std::string min_key,
+          std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
+          std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
+          std::shared_ptr<BlockCache> cache, std::shared_ptr<BloomCache> bloom_cache);
+
+  std::shared_ptr<BloomCache::Data> LoadBloom() const;
 
   bool ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string_view key, MemEntry& entry) const;
   bool ReadBlockRange(std::uint64_t start, std::uint64_t end,
@@ -53,13 +58,18 @@ namespace dkv {
 
   std::filesystem::path path_;
   std::vector<BlockIndexEntry> blocks_;
-  BloomFilter bloom_;
   std::string min_key_;
   std::string max_key_;
   std::uint64_t max_seq_;
   std::uint64_t file_size_;
   std::uint64_t bloom_start_;
   std::shared_ptr<BlockCache> cache_;
+  std::shared_ptr<BloomCache> bloom_cache_;
+  std::uint32_t bloom_bytes_{0};
+  std::uint32_t bloom_bits_per_key_{0};
+  bool pin_bloom_{false};
+  mutable std::weak_ptr<BloomCache::Data> bloom_ref_;
+  mutable std::shared_ptr<BloomCache::Data> pinned_bloom_;
   mutable std::ifstream file_;
   mutable std::mutex io_mu_;
 };

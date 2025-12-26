@@ -102,17 +102,22 @@ bool ReadFooter(std::ifstream& in, std::uint64_t file_size, ParsedFooter& footer
 
 }  // namespace
 
-SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, BloomFilter bloom,
-                 std::string min_key, std::string max_key, std::uint64_t max_seq, std::uint64_t file_size,
-                 std::uint64_t bloom_start)
+SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, std::string min_key,
+                 std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
+                 std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
+                 std::shared_ptr<BlockCache> cache, std::shared_ptr<BloomCache> bloom_cache)
     : path_(std::move(path)),
       blocks_(std::move(index)),
-      bloom_(std::move(bloom)),
       min_key_(std::move(min_key)),
       max_key_(std::move(max_key)),
       max_seq_(max_seq),
       file_size_(file_size),
       bloom_start_(bloom_start),
+      cache_(std::move(cache)),
+      bloom_cache_(std::move(bloom_cache)),
+      bloom_bytes_(bloom_bytes),
+      bloom_bits_per_key_(bloom_bits_per_key),
+      pin_bloom_(pin_bloom),
       file_(path_, std::ios::binary) {}
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
@@ -125,7 +130,50 @@ Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEn
   return WriteImpl(path, entries, block_size, bloom_bits_per_key);
 }
 
+std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
+  if (pin_bloom_ && pinned_bloom_) return pinned_bloom_;
+  if (auto cached = bloom_ref_.lock()) return cached;
+
+  std::shared_ptr<BloomCache::Data> data;
+  if (bloom_cache_) {
+    data = bloom_cache_->Get(path_.string());
+  }
+
+  if (!data) {
+    // Load from disk
+    std::vector<std::uint8_t> bits(bloom_bytes_, 0);
+    {
+      std::lock_guard lock(io_mu_);
+      if (!file_.is_open()) return nullptr;
+      file_.clear();
+      file_.seekg(static_cast<std::streamoff>(bloom_start_));
+      std::uint32_t bits_per_key = 0;
+      std::uint32_t bytes = 0;
+      if (!ReadU32(file_, bits_per_key) || !ReadU32(file_, bytes)) return nullptr;
+      if (bytes != bloom_bytes_) return nullptr;
+      if (!file_.read(reinterpret_cast<char*>(bits.data()), static_cast<std::streamsize>(bloom_bytes_))) return nullptr;
+    }
+    const std::uint32_t k = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(bloom_bits_per_key_ * 0.69));
+    if (bloom_cache_) {
+      data = bloom_cache_->Put(path_.string(), std::move(bits), static_cast<std::uint32_t>(bloom_bits_per_key_), k);
+    }
+    if (!data) {
+      BloomFilter bloom;
+      bloom.SetData(std::move(bits), static_cast<std::uint32_t>(bloom_bits_per_key_), k);
+      data = std::make_shared<BloomCache::Data>(BloomCache::Data{std::move(bloom), static_cast<std::size_t>(bloom_bytes_)});
+    }
+  }
+
+  if (pin_bloom_) {
+    pinned_bloom_ = data;
+  } else {
+    bloom_ref_ = data;
+  }
+  return data;
+}
+
 Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
+                    const std::shared_ptr<BloomCache>& bloom_cache, bool pin_bloom,
                     std::shared_ptr<SSTable>& out) {
   auto size_opt = FileSize(path);
   if (!size_opt) return Status::IOError("unable to stat sstable: " + path.string());
@@ -140,19 +188,6 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
   if (footer.index_start > *size_opt || footer.bloom_start > *size_opt) {
     return Status::Corruption("sstable index/bloom out of range: " + path.string());
   }
-
-  in.seekg(static_cast<std::streamoff>(footer.bloom_start));
-  std::uint32_t bloom_bits = 0;
-  std::uint32_t bloom_bytes = 0;
-  if (!ReadU32(in, bloom_bits) || !ReadU32(in, bloom_bytes)) {
-    return Status::Corruption("bad bloom header: " + path.string());
-  }
-  std::vector<std::uint8_t> bloom_data(bloom_bytes, 0);
-  if (!in.read(reinterpret_cast<char*>(bloom_data.data()), static_cast<std::streamsize>(bloom_bytes))) {
-    return Status::Corruption("bad bloom data: " + path.string());
-  }
-  BloomFilter bloom;
-  bloom.SetData(std::move(bloom_data), bloom_bits, std::max<std::uint32_t>(1, static_cast<std::uint32_t>(bloom_bits * 0.69)));
 
   in.seekg(static_cast<std::streamoff>(footer.index_start));
   std::vector<BlockIndexEntry> index;
@@ -187,17 +222,26 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     max_key = key;
   }
 
+  // Minimal bloom info (lazy load on demand)
+  in.seekg(static_cast<std::streamoff>(footer.bloom_start));
+  std::uint32_t bloom_bits = 0;
+  std::uint32_t bloom_bytes = 0;
+  if (!ReadU32(in, bloom_bits) || !ReadU32(in, bloom_bytes)) {
+    return Status::Corruption("bad bloom header: " + path.string());
+  }
+
   auto sstable = std::shared_ptr<SSTable>(
-      new SSTable(path, std::move(index), std::move(bloom), index.front().key, max_key, footer.max_seq,
-                  *size_opt, footer.bloom_start));
-  sstable->cache_ = cache;
+      new SSTable(path, std::move(index), index.front().key, max_key, footer.max_seq, *size_opt, footer.bloom_start,
+                  bloom_bytes, bloom_bits, pin_bloom, cache, bloom_cache));
   if (!sstable->file_.is_open()) return Status::IOError("failed to open sstable reader: " + path.string());
   out = std::move(sstable);
   return Status::OK();
 }
 
 bool SSTable::Get(std::string_view key, MemEntry& entry) const {
-  if (!bloom_.MayContain(key)) return false;
+  auto bloom_data = LoadBloom();
+  if (!bloom_data) return false;
+  if (!bloom_data->bloom.MayContain(key)) return false;
   // Find block whose first key is <= target.
   auto it = std::upper_bound(
       blocks_.begin(), blocks_.end(), key,

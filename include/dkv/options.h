@@ -17,6 +17,8 @@ struct Options {
   std::size_t sstable_block_size_bytes{4 * 1024};
   // Bloom filter bits per key.
   std::size_t bloom_bits_per_key{10};
+  // Bloom cache size in bytes (0 disables bloom cache; bloom then loads lazily per use).
+  std::size_t bloom_cache_capacity_bytes{0};
   // Block cache size in bytes (0 disables cache).
   std::size_t block_cache_capacity_bytes{32 * 1024 * 1024};
   // Max Level-0 file count before compaction.
