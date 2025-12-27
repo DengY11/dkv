@@ -5,6 +5,16 @@
 #include <string_view>
 #include <utility>
 
+#if DKV_USE_SNAPPY
+#include <snappy.h>
+#endif
+#if DKV_USE_ZSTD
+#include <zstd.h>
+#endif
+#if DKV_USE_LZ4
+#include <lz4.h>
+#endif
+
 namespace dkv {
 
 namespace {
@@ -33,21 +43,95 @@ inline void AppendU64(std::string& buf, std::uint64_t v) {
   for (int i = 0; i < 8; ++i) buf.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
 }
 
-// Stub Snappy hooks: if compression fails/unavailable, return false and we store raw.
-bool SnappyCompress(std::string_view input, std::string& output) {
-  (void)input;
+#if DKV_USE_SNAPPY
+constexpr std::uint8_t kCompressionCode = 1;
+#elif DKV_USE_ZSTD
+constexpr std::uint8_t kCompressionCode = 2;
+#elif DKV_USE_LZ4
+constexpr std::uint8_t kCompressionCode = 3;
+#else
+constexpr std::uint8_t kCompressionCode = 0;
+#endif
+
+bool CompressData(std::string_view input, std::string& output, std::uint8_t& code) {
   output.clear();
+  code = 0;
+#if DKV_USE_SNAPPY
+  size_t max_sz = snappy::MaxCompressedLength(input.size());
+  output.resize(max_sz);
+  size_t out_sz = 0;
+  snappy::RawCompress(input.data(), input.size(), output.data(), &out_sz);
+  output.resize(out_sz);
+  code = 1;
+  return true;
+#elif DKV_USE_ZSTD
+  size_t bound = ZSTD_compressBound(input.size());
+  output.resize(bound);
+  size_t res = ZSTD_compress(output.data(), bound, input.data(), input.size(), ZSTD_CLEVEL_DEFAULT);
+  if (ZSTD_isError(res)) return false;
+  output.resize(res);
+  code = 2;
+  return true;
+#elif DKV_USE_LZ4
+  int bound = LZ4_compressBound(static_cast<int>(input.size()));
+  output.resize(static_cast<std::size_t>(bound));
+  int res = LZ4_compress_default(input.data(), output.data(), static_cast<int>(input.size()), bound);
+  if (res <= 0) return false;
+  output.resize(static_cast<std::size_t>(res));
+  code = 3;
+  return true;
+#else
+  (void)input;
+  (void)output;
+  (void)code;
   return false;
+#endif
 }
 
-bool SnappyUncompress(std::string_view input, std::string& output) {
-  output.assign(input);
-  return true;
+bool DecompressData(std::uint8_t code, std::string_view input, std::string& output, std::size_t raw_size) {
+  output.clear();
+  if (code == 0) {
+    output.assign(input);
+    return true;
+  } else if (code == 1) {
+#if DKV_USE_SNAPPY
+    size_t uncompressed = 0;
+    if (!snappy::GetUncompressedLength(input.data(), input.size(), &uncompressed)) return false;
+    output.resize(uncompressed);
+    return snappy::RawUncompress(input.data(), input.size(), output.data());
+#else
+    (void)raw_size;
+    return false;
+#endif
+  } else if (code == 2) {
+#if DKV_USE_ZSTD
+    output.resize(raw_size);
+    size_t res = ZSTD_decompress(output.data(), raw_size, input.data(), input.size());
+    if (ZSTD_isError(res)) return false;
+    output.resize(res);
+    return true;
+#else
+    return false;
+#endif
+  } else if (code == 3) {
+#if DKV_USE_LZ4
+    output.resize(raw_size);
+    int res = LZ4_decompress_safe(input.data(), output.data(), static_cast<int>(input.size()),
+                                  static_cast<int>(raw_size));
+    if (res < 0) return false;
+    output.resize(static_cast<std::size_t>(res));
+    return true;
+#else
+    (void)raw_size;
+    return false;
+#endif
+  }
+  return false;
 }
 
 template <typename Entry>
 Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& entries, std::size_t block_size,
-                 std::size_t bloom_bits_per_key, CompressionType compression) {
+                 std::size_t bloom_bits_per_key, bool enable_compress) {
   if (entries.empty()) return Status::InvalidArgument("no entries to write");
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
@@ -77,20 +161,23 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     if (block_buf.empty()) return Status::OK();
     // Compress block if enabled.
     std::string compressed;
-    bool use_compression = false;
-    if (compression == CompressionType::kSnappy) {
-      if (SnappyCompress(block_buf, compressed)) {
-        // require at least 12.5% savings.
-        if (compressed.size() + compressed.size() / 8 < block_buf.size()) {
-          use_compression = true;
+    bool use_compression = enable_compress && kCompressionCode != 0;
+    std::uint8_t comp_code = 0;
+    if (use_compression) {
+      if (CompressData(block_buf, compressed, comp_code)) {
+        // require at least 12.5% savings
+        if (!(compressed.size() + compressed.size() / 8 < block_buf.size())) {
+          use_compression = false;
         }
+      } else {
+        use_compression = false;
       }
     }
     const std::string_view payload = use_compression ? std::string_view(compressed) : std::string_view(block_buf);
     BlockHeader hdr;
     hdr.raw_size = static_cast<std::uint32_t>(block_buf.size());
     hdr.stored_size = static_cast<std::uint32_t>(payload.size());
-    hdr.compression = use_compression ? 1 : 0;
+    hdr.compression = use_compression ? comp_code : 0;
 
     WriteU32(out, hdr.raw_size);
     WriteU32(out, hdr.stored_size);
@@ -188,13 +275,13 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
       file_(path_, std::ios::binary) {}
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression) {
-  return WriteImpl(path, entries, block_size, bloom_bits_per_key, compression);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key, enable_compress);
 }
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression) {
-  return WriteImpl(path, entries, block_size, bloom_bits_per_key, compression);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key, enable_compress);
 }
 
 std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
@@ -291,8 +378,10 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
   }
   std::string raw;
   std::string_view data_view;
-  if (hdr.compression == 1) {
-    if (!SnappyUncompress(payload, raw)) return Status::Corruption("failed to uncompress block");
+  if (hdr.compression != 0) {
+    if (!DecompressData(hdr.compression, payload, raw, hdr.raw_size)) {
+      return Status::Corruption("failed to uncompress block");
+    }
     data_view = raw;
   } else {
     data_view = payload;
@@ -439,8 +528,8 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<Mem
 
   std::string raw;
   std::string_view data_view;
-  if (hdr.compression == 1) {
-    if (!SnappyUncompress(payload, raw)) return false;
+  if (hdr.compression != 0) {
+    if (!DecompressData(hdr.compression, payload, raw, hdr.raw_size)) return false;
     data_view = raw;
   } else {
     data_view = payload;

@@ -114,7 +114,7 @@ bool TestCompressionOption() {
   dkv::Options opts;
   opts.data_dir = dir;
   opts.memtable_soft_limit_bytes = 32;  // force blocks/flush
-  opts.compression = dkv::CompressionType::kSnappy;
+  opts.enable_compress = true;
 
   std::unique_ptr<dkv::DB> db;
   if (!ExpectOk(dkv::DB::Open(opts, db), "open db compress")) return false;

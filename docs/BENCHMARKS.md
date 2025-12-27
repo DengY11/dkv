@@ -52,6 +52,7 @@ Command:
 ```
 
 ### RESULT
+Intel E5-2698v4*2(40core 80threads) 128G(ddr4)
 ```bash
 dkv benchmark suite
   n=1000000, batch=50000, threads=8, ops_per_thread=200000, sync_n=1000, seed=12345

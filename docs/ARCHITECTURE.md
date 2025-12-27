@@ -1,11 +1,11 @@
-# Architecture and Tuning
+# Architecture
 
 `dkv` is a compact LSM store: WAL + CRC for durability, MANIFEST for recovery, active/immutable memtables with a background flush thread, and basic metrics for observability. The code stays small so components are easy to swap or extend.
 
-## Components
-- **Memtable (`src/memtable.*`)**: sharded `pmr::unordered_map` (16 shards by default) with per-shard locking and a monotonic buffer resource to cut allocations. Snapshot sorts each shard locally, then does a k-way merge; flush uses `string_view`-based views to avoid extra copies. Tracks approximate memory to trigger flushes. One active memtable plus a queue of immutables flushed in the background.
+## Components and Data Structures
+- **Memtable (`src/memtable.*`)**: sharded `pmr::unordered_map` (16 shards by default) with per-shard locks and a monotonic buffer resource to reduce allocations. Snapshot sorts each shard locally, then does a k-way merge; flush uses `string_view` views to avoid extra copies. Tracks approximate memory to trigger flushes. One active memtable plus a queue of immutables flushed in the background.
 - **WAL (`src/wal.*`)**: append-only log with per-record CRC32. Optional per-write fsync, periodic background sync, and parent-dir fsync on reset/rotation. Replay stops at the first corrupted record. Rotates to `wal-<max_seq>.log` when sealing a memtable.
-- **SSTable (`src/sstable.*`)**: immutable sorted runs. Entry encoding: `[deleted byte][seq][klen][vlen][key][value]`. Blocked layout with sparse block index and Bloom filter; footer stores offsets and magic. Optional block cache (`block_cache_capacity_bytes`). Bloom filters are lazy-loaded on demand; an optional LRU (`bloom_cache_capacity_bytes`) holds shared copies and can pin upper-level blooms in memory.
+- **SSTable (`src/sstable.*`)**: immutable sorted runs. Entry encoding: `[deleted byte][seq][klen][vlen][key][value]`. Blocked layout with sparse block index and Bloom filter; footer stores offsets and magic. Optional block cache (`block_cache_capacity_bytes`). Bloom filters are lazy-loaded on demand; an optional LRU (`bloom_cache_capacity_bytes`) holds shared copies and can pin upper-level blooms in memory. Data blocks optionally compress at write time; the backend is chosen at build time, and each block can fall back to raw if compression is ineffective.
 - **Manifest (`data_dir/MANIFEST`)**: authoritative list of live SSTables and levels. Written atomically (temp file → fsync file → fsync parent dir → rename). Startup prefers manifest, falls back to a directory scan. Recovery replays `wal-*.log` plus `wal.log` in order.
 - **DB (`src/db.*`)**: coordinates WAL, memtables, SSTables. When the active memtable exceeds `memtable_soft_limit_bytes`, it is swapped into the immutable queue, WAL is rotated, a new active memtable is created, and the flush thread writes immutables to L0, deletes their WAL segments, and rewrites the manifest. Leveled compaction keeps L1+ non-overlapping.
 - **Metrics**: cumulative counts for puts/deletes/gets/batches, flush/compaction counts/durations/bytes, and WAL syncs (`DB::GetMetrics`).
@@ -50,23 +50,12 @@ Background WAL sync: if `wal_sync_interval_ms > 0` and `sync_wal == false`, a th
 - Compaction: `compactions`, `compaction_ms`, `compaction_input_bytes`, `compaction_output_bytes`
 - WAL: `wal_syncs` (per-write syncs + background syncs)
 
-## Key Parameters and Tuning
-- **Durability vs latency**
-  - `Options::sync_wal` / `WriteOptions::sync`: fsync every write vs app-level control.
-  - `wal_sync_interval_ms`: periodic background sync (set >0 for durability with lower per-op latency).
-- **Memory / flush cadence**
-  - `memtable_soft_limit_bytes`: larger → fewer flushes and larger L0 runs; smaller → quicker durability and more compaction pressure.
-  - `memtable_shard_count`: more shards reduce write contention but add merge work during flush.
-- **SST layout**
-  - `sstable_target_size_bytes`: run size; larger reduces file count but increases compaction chunk size.
-  - `sstable_block_size_bytes`: read amplification vs index/Bloom overhead trade-off.
-  - `bloom_bits_per_key`: higher reduces false positives at a space cost.
-- **Levels / compaction pressure**
-  - `level0_file_limit`: when L0 compacts.
-  - `level_base_bytes`, `level_size_multiplier`: bytes allowed per level; smaller values compact more aggressively.
-  - `block_cache_capacity_bytes`: enable to reduce read IO for hot blocks.
-- **Concurrency**
-  - Writes are serialized by `mu_` for structure updates; reads use a shared lock for SST metadata. Multi-thread writers share one DB; use `WriteBatch` to amortize WAL sync.
+## Compared to LevelDB
+- **Memtable**: LevelDB uses a skiplist; DKV uses a sharded hash table with per-shard locks plus a sort-and-merge snapshot at flush time. This reduces write contention for many writers but adds a sort during flush. Both support batched writes.
+- **SSTable blocks**: LevelDB uses restart points for prefix compression inside blocks. DKV stores raw entries (or fully compressed per block with Snappy/Zstd/LZ4 chosen at build time). Index entries include block size (header+payload) and header carries raw/stored sizes and compression code.
+- **Caches/Bloom**: Both use block cache and Bloom filters; DKV also supports a separate Bloom cache that can pin upper-level blooms.
+- **Compaction**: Same leveled model (L0 overlap, L1+ non-overlap). DKV’s compaction is simpler (no partial overlap trimming) and rewrites the manifest after each compaction.
+- **Durability knobs**: Both offer per-write sync; DKV adds optional periodic WAL sync (`wal_sync_interval_ms`).
 
 ## Example
 See `examples/example.cc` for a minimal usage sample: open DB, put/get, batch write, scan, and print metrics.

@@ -54,5 +54,10 @@ See `docs/` for design notes and tuning tips.
 - `sstable_block_size_bytes`, `bloom_bits_per_key`: read-path trade-offs (Bloom and block index)
 - `block_cache_capacity_bytes`: enable LRU caching of SSTable blocks to cut repeated disk reads
 
+See docs/ARCHITECTURE.md for a detailed walkthrough of the design, data structures, and how memtables/SSTables differ from LevelDB. See docs/OPTIONS.md for a full option matrix and their performance trade-offs.
+
 ## Benchmarks
-详见 `docs/BENCHMARKS.md`，包含 `dkv_bench_suite` 的运行方式、参数说明，以及 DKV/SQLite/LevelDB 的示例结果。
+see docs/BENCHMARKS.md
+
+## Optional compression backend
+see docs/COMPRESSION.md

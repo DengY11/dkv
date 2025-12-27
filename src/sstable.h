@@ -21,9 +21,9 @@ namespace dkv {
 class SSTable {
  public:
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress);
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     const std::shared_ptr<BloomCache>& bloom_cache, bool pin_bloom,
                     std::shared_ptr<SSTable>& out);

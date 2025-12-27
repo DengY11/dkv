@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(dkv LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 option(DKV_BUILD_TESTS "Build unit tests" ON)
 option(DKV_BUILD_BENCHMARKS "Build benchmarks" ON)
 
@@ -22,6 +24,72 @@ add_library(dkv STATIC ${DKV_SOURCES})
 target_include_directories(dkv
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# select compression backend
+# use like this cmake -B build -DDKV_COMPRESSION=snappy ..
+# or cmake -B build -DDKV_COMPRESSION=zstd ..
+# or cmake -B build -DDKV_COMPRESSION=lz4 ..
+set(DKV_COMPRESSION "auto" CACHE STRING "Compression backend: auto|snappy|zstd|lz4|none")
+set_property(CACHE DKV_COMPRESSION PROPERTY STRINGS auto snappy zstd lz4 none)
+
+set(DKV_USE_SNAPPY 0)
+set(DKV_USE_ZSTD 0)
+set(DKV_USE_LZ4 0)
+
+if(DKV_COMPRESSION STREQUAL "snappy")
+  find_package(Snappy QUIET)
+  if(Snappy_FOUND)
+    set(DKV_USE_SNAPPY 1)
+    target_link_libraries(dkv PUBLIC Snappy::snappy)
+    message(STATUS "DKV compression backend: snappy")
+  else()
+    message(FATAL_ERROR "Snappy requested via DKV_COMPRESSION=snappy but package not found")
+  endif()
+elseif(DKV_COMPRESSION STREQUAL "zstd")
+  find_package(ZSTD QUIET)
+  if(ZSTD_FOUND)
+    set(DKV_USE_ZSTD 1)
+    target_link_libraries(dkv PUBLIC ZSTD::ZSTD)
+    message(STATUS "DKV compression backend: zstd")
+  else()
+    message(FATAL_ERROR "ZSTD requested via DKV_COMPRESSION=zstd but package not found")
+  endif()
+elseif(DKV_COMPRESSION STREQUAL "lz4")
+  find_package(LZ4 QUIET)
+  if(LZ4_FOUND)
+    set(DKV_USE_LZ4 1)
+    target_link_libraries(dkv PUBLIC LZ4::lz4)
+    message(STATUS "DKV compression backend: lz4")
+  else()
+    message(FATAL_ERROR "LZ4 requested via DKV_COMPRESSION=lz4 but package not found")
+  endif()
+elseif(DKV_COMPRESSION STREQUAL "none")
+  message(STATUS "DKV compression backend: none")
+else() # auto
+  find_package(Snappy QUIET)
+  find_package(ZSTD QUIET)
+  find_package(LZ4 QUIET)
+  if(Snappy_FOUND)
+    set(DKV_USE_SNAPPY 1)
+    target_link_libraries(dkv PUBLIC Snappy::snappy)
+    message(STATUS "DKV compression backend (auto): snappy")
+  elseif(ZSTD_FOUND)
+    set(DKV_USE_ZSTD 1)
+    target_link_libraries(dkv PUBLIC ZSTD::ZSTD)
+    message(STATUS "DKV compression backend (auto): zstd")
+  elseif(LZ4_FOUND)
+    set(DKV_USE_LZ4 1)
+    target_link_libraries(dkv PUBLIC LZ4::lz4)
+    message(STATUS "DKV compression backend (auto): lz4")
+  else()
+    message(STATUS "DKV compression backend (auto): none")
+  endif()
+endif()
+
+target_compile_definitions(dkv PRIVATE
+  DKV_USE_SNAPPY=${DKV_USE_SNAPPY}
+  DKV_USE_ZSTD=${DKV_USE_ZSTD}
+  DKV_USE_LZ4=${DKV_USE_LZ4})
 
 if(MSVC)
   target_compile_options(dkv PRIVATE /W4 /permissive-)
