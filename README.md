@@ -1,6 +1,6 @@
-# dkv: a tiny LSM-tree key-value store (C++20)
+# dkv: a LSM-tree key-value store (C++20)
 
-An embedded, LevelDB-like key-value store implemented from scratch with a clear layout, minimal abstractions, and performance-friendly defaults. Ships as a small static library plus tests and benchmarks.
+An embedded, high performance LSM-tree key-value store. Ships as a static library plus tests and benchmarks.
 
 ## Features
 - Write-ahead log for crash safety, memtable backed by sorted std::map
@@ -14,17 +14,7 @@ An embedded, LevelDB-like key-value store implemented from scratch with a clear 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-ctest --test-dir build         # run unit tests
-./build/dkv_bench              # run CRUD + SQLite comparison benchmark
-# SQLite comparison builds automatically if system SQLite3 dev libs are available
 ```
-
-## Layout
-- `include/` public headers
-- `src/` storage, WAL, memtable, SSTable, DB plumbing
-- `tests/` self-contained assertions without third-party deps
-- `benchmarks/` micro-benchmark for put/get throughput
-- `docs/` architecture notes and usage details
 
 ## Quickstart
 ```cpp
