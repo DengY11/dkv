@@ -51,3 +51,6 @@ see docs/BENCHMARKS.md
 
 ## Optional compression backend
 see docs/COMPRESSION.md
+
+## License
+MIT License (see LICENSE)
