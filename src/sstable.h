@@ -11,6 +11,7 @@
 
 #include "block_cache.h"
 #include "bloom_cache.h"
+#include "dkv/options.h"
 #include "memtable.h"
 #include "bloom.h"
 #include "util.h"
@@ -20,9 +21,9 @@ namespace dkv {
 class SSTable {
  public:
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression);
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     const std::shared_ptr<BloomCache>& bloom_cache, bool pin_bloom,
                     std::shared_ptr<SSTable>& out);
@@ -42,6 +43,7 @@ class SSTable {
   struct BlockIndexEntry {
     std::string key;
     std::uint64_t offset{0};
+    std::uint32_t size{0};
   };
 
   SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, std::string min_key,
@@ -54,7 +56,7 @@ class SSTable {
   bool ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string_view key, MemEntry& entry) const;
   bool ReadBlockRange(std::uint64_t start, std::uint64_t end,
                       std::vector<std::pair<std::string, std::string>>& out, std::size_t limit) const;
-  bool ReadBlock(std::uint64_t start, std::uint64_t end, std::vector<MemEntry>& out) const;
+  bool ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<MemEntry>& out) const;
 
   std::filesystem::path path_;
   std::vector<BlockIndexEntry> blocks_;

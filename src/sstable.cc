@@ -1,6 +1,8 @@
 #include "sstable.h"
 
 #include <algorithm>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace dkv {
@@ -14,9 +16,38 @@ struct ParsedFooter {
   std::uint32_t block_count{0};
 };
 
+struct BlockHeader {
+  std::uint32_t raw_size{0};
+  std::uint32_t stored_size{0};
+  std::uint8_t compression{0};  // 0 = none, 1 = snappy
+};
+
+inline void AppendU8(std::string& buf, std::uint8_t v) { buf.push_back(static_cast<char>(v)); }
+inline void AppendU32(std::string& buf, std::uint32_t v) {
+  buf.push_back(static_cast<char>(v & 0xFFu));
+  buf.push_back(static_cast<char>((v >> 8u) & 0xFFu));
+  buf.push_back(static_cast<char>((v >> 16u) & 0xFFu));
+  buf.push_back(static_cast<char>((v >> 24u) & 0xFFu));
+}
+inline void AppendU64(std::string& buf, std::uint64_t v) {
+  for (int i = 0; i < 8; ++i) buf.push_back(static_cast<char>((v >> (i * 8)) & 0xFFu));
+}
+
+// Stub Snappy hooks: if compression fails/unavailable, return false and we store raw.
+bool SnappyCompress(std::string_view input, std::string& output) {
+  (void)input;
+  output.clear();
+  return false;
+}
+
+bool SnappyUncompress(std::string_view input, std::string& output) {
+  output.assign(input);
+  return true;
+}
+
 template <typename Entry>
 Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& entries, std::size_t block_size,
-                 std::size_t bloom_bits_per_key) {
+                 std::size_t bloom_bits_per_key, CompressionType compression) {
   if (entries.empty()) return Status::InvalidArgument("no entries to write");
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
@@ -29,6 +60,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
   struct LocalIdx {
     std::string key;
     std::uint64_t offset{0};
+    std::uint32_t size{0};
   };
   std::vector<LocalIdx> blocks;
   blocks.reserve(entries.size());
@@ -36,10 +68,43 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
   std::vector<std::string_view> bloom_keys;
   bloom_keys.reserve(entries.size());
 
-  std::uint64_t block_start = static_cast<std::uint64_t>(out.tellp());
-  std::string block_first_key(entries.front().key);
-  blocks.push_back(LocalIdx{block_first_key, block_start});
   std::uint64_t current_block_bytes = 0;
+  std::string block_first_key(entries.front().key);
+  std::uint64_t block_start = static_cast<std::uint64_t>(out.tellp());
+  std::string block_buf;
+  block_buf.reserve(block_size * 2);
+  auto flush_block = [&]() -> Status {
+    if (block_buf.empty()) return Status::OK();
+    // Compress block if enabled.
+    std::string compressed;
+    bool use_compression = false;
+    if (compression == CompressionType::kSnappy) {
+      if (SnappyCompress(block_buf, compressed)) {
+        // require at least 12.5% savings.
+        if (compressed.size() + compressed.size() / 8 < block_buf.size()) {
+          use_compression = true;
+        }
+      }
+    }
+    const std::string_view payload = use_compression ? std::string_view(compressed) : std::string_view(block_buf);
+    BlockHeader hdr;
+    hdr.raw_size = static_cast<std::uint32_t>(block_buf.size());
+    hdr.stored_size = static_cast<std::uint32_t>(payload.size());
+    hdr.compression = use_compression ? 1 : 0;
+
+    WriteU32(out, hdr.raw_size);
+    WriteU32(out, hdr.stored_size);
+    WriteU8(out, hdr.compression);
+    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    if (!out) return Status::IOError("failed to write block");
+    std::uint64_t end = static_cast<std::uint64_t>(out.tellp());
+    blocks.push_back(LocalIdx{block_first_key, block_start,
+                              static_cast<std::uint32_t>(end - block_start)});
+    block_buf.clear();
+    current_block_bytes = 0;
+    block_start = end;
+    return Status::OK();
+  };
 
   for (std::size_t i = 0; i < entries.size(); ++i) {
     const auto& e = entries[i];
@@ -48,22 +113,23 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     bloom_keys.push_back(key_view);
     max_seq = std::max(max_seq, e.seq);
 
-    const auto before = static_cast<std::uint64_t>(out.tellp());
-    WriteU8(out, static_cast<std::uint8_t>(e.deleted ? 1 : 0));
-    WriteU64(out, e.seq);
-    WriteU32(out, static_cast<std::uint32_t>(key_view.size()));
-    WriteU32(out, static_cast<std::uint32_t>(value_view.size()));
-    out.write(key_view.data(), static_cast<std::streamsize>(key_view.size()));
-    out.write(value_view.data(), static_cast<std::streamsize>(value_view.size()));
-    current_block_bytes += static_cast<std::uint64_t>(out.tellp()) - before;
+    const auto before = block_buf.size();
+    block_buf.push_back(static_cast<char>(e.deleted ? 1 : 0));
+    AppendU64(block_buf, e.seq);
+    AppendU32(block_buf, static_cast<std::uint32_t>(key_view.size()));
+    AppendU32(block_buf, static_cast<std::uint32_t>(value_view.size()));
+    block_buf.append(key_view.data(), key_view.size());
+    block_buf.append(value_view.data(), value_view.size());
+    current_block_bytes += block_buf.size() - before;
 
     if (current_block_bytes >= block_size && i + 1 < entries.size()) {
-      block_start = static_cast<std::uint64_t>(out.tellp());
+      Status fs = flush_block();
+      if (!fs.ok()) return fs;
       block_first_key.assign(entries[i + 1].key);
-      blocks.push_back(LocalIdx{block_first_key, block_start});
-      current_block_bytes = 0;
     }
   }
+  Status fs = flush_block();
+  if (!fs.ok()) return fs;
 
   BloomFilter bloom = BloomFilter::Build(bloom_keys, static_cast<std::uint32_t>(bloom_bits_per_key));
   const auto bloom_start = static_cast<std::uint64_t>(out.tellp());
@@ -77,6 +143,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     WriteU32(out, static_cast<std::uint32_t>(idx.key.size()));
     out.write(idx.key.data(), static_cast<std::streamsize>(idx.key.size()));
     WriteU64(out, idx.offset);
+    WriteU32(out, idx.size);
   }
 
   WriteU64(out, index_start);
@@ -121,13 +188,13 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
       file_(path_, std::ios::binary) {}
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key) {
-  return WriteImpl(path, entries, block_size, bloom_bits_per_key);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key, compression);
 }
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key) {
-  return WriteImpl(path, entries, block_size, bloom_bits_per_key);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, CompressionType compression) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key, compression);
 }
 
 std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
@@ -195,31 +262,62 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
   for (std::uint32_t i = 0; i < footer.block_count; ++i) {
     std::uint32_t key_size = 0;
     std::uint64_t offset = 0;
+    std::uint32_t size = 0;
     if (!ReadU32(in, key_size)) return Status::Corruption("bad index in sstable: " + path.string());
     std::string key(key_size, '\0');
     if (!in.read(key.data(), static_cast<std::streamsize>(key_size))) {
       return Status::Corruption("bad index key in sstable: " + path.string());
     }
-    if (!ReadU64(in, offset)) return Status::Corruption("bad index offset in sstable: " + path.string());
-    index.push_back(BlockIndexEntry{std::move(key), offset});
+    if (!ReadU64(in, offset) || !ReadU32(in, size)) {
+      return Status::Corruption("bad index offset/size in sstable: " + path.string());
+    }
+    index.push_back(BlockIndexEntry{std::move(key), offset, size});
   }
 
   if (index.empty()) return Status::Corruption("empty index in sstable: " + path.string());
 
   // Derive max_key by reading the last block's last entry.
   in.seekg(static_cast<std::streamoff>(index.back().offset));
+  BlockHeader hdr;
+  if (!ReadU32(in, hdr.raw_size) || !ReadU32(in, hdr.stored_size) || !ReadU8(in, hdr.compression)) {
+    return Status::Corruption("failed to read block header: " + path.string());
+  }
+  if (index.back().size < sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + hdr.stored_size) {
+    return Status::Corruption("block size too small: " + path.string());
+  }
+  std::string payload(hdr.stored_size, '\0');
+  if (!in.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) {
+    return Status::Corruption("failed to read block payload: " + path.string());
+  }
+  std::string raw;
+  std::string_view data_view;
+  if (hdr.compression == 1) {
+    if (!SnappyUncompress(payload, raw)) return Status::Corruption("failed to uncompress block");
+    data_view = raw;
+  } else {
+    data_view = payload;
+  }
+  if (data_view.size() != hdr.raw_size) {
+    return Status::Corruption("block raw size mismatch: " + path.string());
+  }
   std::string max_key;
-  while (true) {
-    std::uint8_t type = 0;
-    std::uint64_t seq = 0;
-    std::uint32_t key_size = 0, value_size = 0;
-    const auto pos = static_cast<std::uint64_t>(in.tellg());
-    if (pos >= footer.bloom_start) break;
-    if (!ReadU8(in, type) || !ReadU64(in, seq) || !ReadU32(in, key_size) || !ReadU32(in, value_size)) break;
-    std::string key(key_size, '\0');
-    if (!in.read(key.data(), static_cast<std::streamsize>(key_size))) break;
-    in.seekg(static_cast<std::streamoff>(value_size), std::ios::cur);
-    max_key = key;
+  std::size_t offset = 0;
+  while (offset < data_view.size()) {
+    if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
+    offset += 1 + 8;  // type + seq
+    auto read32 = [&](std::size_t pos) -> std::uint32_t {
+      return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
+    };
+    const std::uint32_t key_size = read32(offset);
+    offset += 4;
+    const std::uint32_t value_size = read32(offset);
+    offset += 4;
+    if (offset + key_size + value_size > data_view.size()) break;
+    max_key.assign(data_view.substr(offset, key_size));
+    offset += key_size + value_size;
   }
 
   // Minimal bloom info (lazy load on demand)
@@ -249,38 +347,17 @@ bool SSTable::Get(std::string_view key, MemEntry& entry) const {
   if (it == blocks_.begin()) return false;
   --it;
   std::uint64_t start = it->offset;
-  std::uint64_t end = (it + 1 == blocks_.end()) ? bloom_start_ : (it + 1)->offset;
-  return ReadEntryRange(start, end, key, entry);
+  std::uint64_t size = it->size;
+  return ReadEntryRange(start, start + size, key, entry);
 }
 
 Status SSTable::LoadAll(std::vector<MemEntry>& out) const {
-  std::lock_guard lock(io_mu_);
-  if (!file_.is_open()) return Status::IOError("sstable file not open");
-  file_.clear();
-  file_.seekg(0);
-  while (static_cast<std::uint64_t>(file_.tellg()) < bloom_start_) {
-    std::uint8_t type = 0;
-    std::uint64_t seq = 0;
-    std::uint32_t key_size = 0;
-    std::uint32_t value_size = 0;
-    if (!ReadU8(file_, type) || !ReadU64(file_, seq) || !ReadU32(file_, key_size) ||
-        !ReadU32(file_, value_size)) {
-      break;
+  for (const auto& b : blocks_) {
+    std::vector<MemEntry> block;
+    if (!ReadBlock(b.offset, b.size, block)) {
+      return Status::Corruption("failed to read block: " + path_.string());
     }
-    std::string key(key_size, '\0');
-    std::string value(value_size, '\0');
-    if (!file_.read(key.data(), static_cast<std::streamsize>(key_size))) {
-      return Status::Corruption("bad entry key in sstable: " + path_.string());
-    }
-    if (!file_.read(value.data(), static_cast<std::streamsize>(value_size))) {
-      return Status::Corruption("bad entry value in sstable: " + path_.string());
-    }
-    MemEntry e;
-    e.key = std::move(key);
-    e.value = std::move(value);
-    e.seq = seq;
-    e.deleted = type != 0;
-    out.push_back(std::move(e));
+    out.insert(out.end(), std::make_move_iterator(block.begin()), std::make_move_iterator(block.end()));
   }
   return Status::OK();
 }
@@ -295,7 +372,7 @@ Status SSTable::Scan(std::string_view from, std::size_t limit,
   std::size_t added = 0;
   for (; it != blocks_.end() && added < limit; ++it) {
     std::uint64_t start = it->offset;
-    std::uint64_t end = (it + 1 == blocks_.end()) ? bloom_start_ : (it + 1)->offset;
+    std::uint64_t end = start + it->size;
     if (!ReadBlockRange(start, end, out, limit - added)) {
       return Status::Corruption("failed scan read: " + path_.string());
     }
@@ -317,7 +394,7 @@ bool SSTable::ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string
     }
   }
   std::vector<MemEntry> block;
-  if (!ReadBlock(start, end, block)) return false;
+  if (!ReadBlock(start, end - start, block)) return false;
   if (cache_) cache_->Put(path_.string(), start, block);
   auto it = std::find_if(block.begin(), block.end(), [&](const MemEntry& e) { return e.key == key; });
   if (it == block.end()) return false;
@@ -338,7 +415,7 @@ bool SSTable::ReadBlockRange(std::uint64_t start, std::uint64_t end,
     }
   }
   std::vector<MemEntry> block;
-  if (!ReadBlock(start, end, block)) return false;
+  if (!ReadBlock(start, end - start, block)) return false;
   if (cache_) cache_->Put(path_.string(), start, block);
   for (const auto& e : block) {
     if (!e.deleted && out.size() < limit) out.emplace_back(e.key, e.value);
@@ -346,24 +423,53 @@ bool SSTable::ReadBlockRange(std::uint64_t start, std::uint64_t end,
   return true;
 }
 
-bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t end, std::vector<MemEntry>& out) const {
+bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<MemEntry>& out) const {
   std::lock_guard lock(io_mu_);
   if (!file_.is_open()) return false;
   file_.clear();
   file_.seekg(static_cast<std::streamoff>(start));
-  while (static_cast<std::uint64_t>(file_.tellg()) < end) {
-    std::uint8_t type = 0;
+
+  BlockHeader hdr;
+  if (!ReadU32(file_, hdr.raw_size) || !ReadU32(file_, hdr.stored_size)) return false;
+  if (!ReadU8(file_, hdr.compression)) return false;
+  const std::uint64_t header_bytes = sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression);
+  if (header_bytes + hdr.stored_size > size) return false;
+  std::string payload(hdr.stored_size, '\0');
+  if (!file_.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) return false;
+
+  std::string raw;
+  std::string_view data_view;
+  if (hdr.compression == 1) {
+    if (!SnappyUncompress(payload, raw)) return false;
+    data_view = raw;
+  } else {
+    data_view = payload;
+  }
+  if (data_view.size() != hdr.raw_size) return false;
+
+  std::size_t offset = 0;
+  while (offset < data_view.size()) {
+    if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
+    const std::uint8_t type = static_cast<std::uint8_t>(data_view[offset]);
+    offset += 1;
     std::uint64_t seq = 0;
-    std::uint32_t key_size = 0;
-    std::uint32_t value_size = 0;
-    if (!ReadU8(file_, type) || !ReadU64(file_, seq) || !ReadU32(file_, key_size) ||
-        !ReadU32(file_, value_size)) {
-      break;
-    }
-    std::string key(key_size, '\0');
-    if (!file_.read(key.data(), static_cast<std::streamsize>(key_size))) return false;
-    std::string value(value_size, '\0');
-    if (!file_.read(value.data(), static_cast<std::streamsize>(value_size))) return false;
+    for (int i = 0; i < 8; ++i) seq |= static_cast<std::uint64_t>(static_cast<unsigned char>(data_view[offset + i])) << (8 * i);
+    offset += 8;
+    auto read32 = [&](std::size_t pos) -> std::uint32_t {
+      return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
+    };
+    const std::uint32_t key_size = read32(offset);
+    offset += 4;
+    const std::uint32_t value_size = read32(offset);
+    offset += 4;
+    if (offset + key_size + value_size > data_view.size()) break;
+    std::string key(data_view.substr(offset, key_size));
+    offset += key_size;
+    std::string value(data_view.substr(offset, value_size));
+    offset += value_size;
     MemEntry e;
     e.key = std::move(key);
     e.value = std::move(value);

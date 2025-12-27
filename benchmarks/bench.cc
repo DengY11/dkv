@@ -707,25 +707,47 @@ CrudStats BenchSQLite(const Args& args, Mode mode) {
   };
 
   auto start_put = std::chrono::steady_clock::now();
-  ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin put");
-  run_loop('v', rng_put, [&](std::size_t count) {
-    if (use_batch) {
-      for (std::size_t j = 0; j < count; ++j) {
-        StepWithRetry(db, put_stmt, "sqlite put", [&] {
-          sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
-          sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
-        });
+  if (sync) {
+    run_loop('v', rng_put, [&](std::size_t count) {
+      ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin put");
+      if (use_batch) {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite put", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
+      } else {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite put", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
       }
-    } else {
-      for (std::size_t j = 0; j < count; ++j) {
-        StepWithRetry(db, put_stmt, "sqlite put", [&] {
-          sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
-          sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
-        });
+      ExecWithRetry(db, "COMMIT;", "commit put");
+    });
+  } else {
+    ExecWithRetry(db, "BEGIN;", "begin put");
+    run_loop('v', rng_put, [&](std::size_t count) {
+      if (use_batch) {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite put", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
+      } else {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite put", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
       }
-    }
-  });
-  ExecWithRetry(db, "COMMIT;", "commit put");
+    });
+    ExecWithRetry(db, "COMMIT;", "commit put");
+  }
   stats.put_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - start_put)
                      .count();
@@ -747,47 +769,89 @@ CrudStats BenchSQLite(const Args& args, Mode mode) {
                      .count();
 
   auto start_update = std::chrono::steady_clock::now();
-  ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin update");
-  run_loop('u', rng_upd, [&](std::size_t count) {
-    if (use_batch) {
-      for (std::size_t j = 0; j < count; ++j) {
-        StepWithRetry(db, put_stmt, "sqlite update", [&] {
-          sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
-          sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
-        });
+  if (sync) {
+    run_loop('u', rng_upd, [&](std::size_t count) {
+      ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin update");
+      if (use_batch) {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite update", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
+      } else {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite update", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
       }
-    } else {
-      for (std::size_t j = 0; j < count; ++j) {
-        StepWithRetry(db, put_stmt, "sqlite update", [&] {
-          sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
-          sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
-        });
+      ExecWithRetry(db, "COMMIT;", "commit update");
+    });
+  } else {
+    ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin update");
+    run_loop('u', rng_upd, [&](std::size_t count) {
+      if (use_batch) {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite update", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
+      } else {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, put_stmt, "sqlite update", [&] {
+            sqlite3_bind_text(put_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(put_stmt, 2, values[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
       }
-    }
-  });
-  ExecWithRetry(db, "COMMIT;", "commit update");
+    });
+    ExecWithRetry(db, "COMMIT;", "commit update");
+  }
   stats.update_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start_update)
                         .count();
 
   auto start_delete = std::chrono::steady_clock::now();
-  ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin delete");
-  run_loop('x', rng_del, [&](std::size_t count) {
-    if (use_batch) {
-      for (std::size_t j = 0; j < count; ++j) {
-        StepWithRetry(db, del_stmt, "sqlite delete", [&] {
-          sqlite3_bind_text(del_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
-        });
+  if (sync) {
+    run_loop('x', rng_del, [&](std::size_t count) {
+      ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin delete");
+      if (use_batch) {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, del_stmt, "sqlite delete", [&] {
+            sqlite3_bind_text(del_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
+      } else {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, del_stmt, "sqlite delete", [&] {
+            sqlite3_bind_text(del_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
       }
-    } else {
-      for (std::size_t j = 0; j < count; ++j) {
-        StepWithRetry(db, del_stmt, "sqlite delete", [&] {
-          sqlite3_bind_text(del_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
-        });
+      ExecWithRetry(db, "COMMIT;", "commit delete");
+    });
+  } else {
+    ExecWithRetry(db, "BEGIN IMMEDIATE;", "begin delete");
+    run_loop('x', rng_del, [&](std::size_t count) {
+      if (use_batch) {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, del_stmt, "sqlite delete", [&] {
+            sqlite3_bind_text(del_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
+      } else {
+        for (std::size_t j = 0; j < count; ++j) {
+          StepWithRetry(db, del_stmt, "sqlite delete", [&] {
+            sqlite3_bind_text(del_stmt, 1, keys[j].c_str(), -1, SQLITE_TRANSIENT);
+          });
+        }
       }
-    }
-  });
-  ExecWithRetry(db, "COMMIT;", "commit delete");
+    });
+    ExecWithRetry(db, "COMMIT;", "commit delete");
+  }
   stats.delete_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - start_delete)
                         .count();

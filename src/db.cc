@@ -659,7 +659,8 @@ Status DB::Impl::FlushImmutable(const ImmutableMem& imm) {
   const auto filename = "sst-l0-" + std::to_string(max_seq) + ".sst";
   const auto path = sst_dir_ / filename;
 
-  Status s = SSTable::Write(path, entries_view, options_.sstable_block_size_bytes, options_.bloom_bits_per_key);
+  Status s = SSTable::Write(path, entries_view, options_.sstable_block_size_bytes, options_.bloom_bits_per_key,
+                            options_.compression);
   if (!s.ok()) return s;
 
   std::shared_ptr<SSTable> table;
@@ -789,7 +790,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
           std::to_string(out_tables.size()) + ".sst";
       const auto path = sst_dir_ / filename;
       Status ws = SSTable::Write(path, chunk_data, options_.sstable_block_size_bytes,
-                                 options_.bloom_bits_per_key);
+                                 options_.bloom_bits_per_key, options_.compression);
       if (!ws.ok()) return ws;
       std::shared_ptr<SSTable> t;
       bool pin_bloom = target_level > 0;

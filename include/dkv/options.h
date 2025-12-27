@@ -5,6 +5,11 @@
 
 namespace dkv {
 
+enum class CompressionType {
+  kNone = 0,
+  kSnappy = 1,
+};
+
 struct Options {
   std::filesystem::path data_dir{"dkv-data"};
   // Memtable bytes before triggering a flush.
@@ -33,6 +38,8 @@ struct Options {
   bool enable_crc{true};
   // Number of shards in memtable for concurrency (power of two recommended).
   std::size_t memtable_shard_count{16};
+  // Compression for SSTable data blocks.
+  CompressionType compression{CompressionType::kNone};
 };
 
 struct WriteOptions {

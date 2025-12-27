@@ -109,6 +109,37 @@ bool TestCompaction() {
   return true;
 }
 
+bool TestCompressionOption() {
+  auto dir = TempDir("dkv-compress");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 32;  // force blocks/flush
+  opts.compression = dkv::CompressionType::kSnappy;
+
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db compress")) return false;
+
+  dkv::WriteOptions wopts;
+  if (!ExpectOk(db->Put(wopts, "c1", std::string(64, 'a')), "put c1")) return false;
+  if (!ExpectOk(db->Put(wopts, "c2", std::string(128, 'b')), "put c2")) return false;
+  if (!ExpectOk(db->Put(wopts, "c3", std::string(16, 'c')), "put c3")) return false;
+  if (!ExpectOk(db->Flush(), "flush compress")) return false;
+  db.reset();
+
+  std::unique_ptr<dkv::DB> db2;
+  if (!ExpectOk(dkv::DB::Open(opts, db2), "reopen compress")) return false;
+  std::string value;
+  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c1", value), "get c1")) return false;
+  assert(value == std::string(64, 'a'));
+  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c2", value), "get c2")) return false;
+  assert(value == std::string(128, 'b'));
+  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c3", value), "get c3")) return false;
+  assert(value == std::string(16, 'c'));
+
+  std::filesystem::remove_all(dir);
+  return true;
+}
+
 bool TestBatchWrite() {
   auto dir = TempDir("dkv-batch");
   dkv::Options opts;
@@ -329,6 +360,7 @@ int main() {
   ok &= TestBasicPutGet();
   ok &= TestFlushAndRecover();
   ok &= TestCompaction();
+  ok &= TestCompressionOption();
   ok &= TestBatchWrite();
   ok &= TestFuzzAgainstModel();
   ok &= TestFuzzWithReopen();
