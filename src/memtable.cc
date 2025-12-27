@@ -122,11 +122,19 @@ struct MemTable::Shard {
   std::size_t memory_usage_{0};
 };
 
-MemTable::MemTable(std::size_t shard_count) : shard_count_(shard_count) {
+MemTable::MemTable(std::size_t shard_count, std::size_t approx_capacity_bytes)
+    : shard_count_(shard_count == 0 ? 1 : shard_count) {
   shards_.reserve(shard_count_);
-  // Rough per-shard reserve: assume average record size ~ (key+value ~ 128B) -> memtable_soft_limit / 128 / shards.
-  // Soft limit not passed here, so use a default of 1<<15 buckets (~32k) to avoid rehash storms.
-  const std::size_t reserve_buckets = 1 << 15;
+  constexpr std::size_t kMinBucketsPerShard = 1 << 15;
+  constexpr std::size_t kApproxEntryBytes = 64;  // rough key+value size for bucket sizing
+  std::size_t reserve_buckets = kMinBucketsPerShard;
+  if (approx_capacity_bytes > 0) {
+    const auto approx_entries = approx_capacity_bytes / kApproxEntryBytes;
+    const auto per_shard = approx_entries / shard_count_;
+    if (per_shard > reserve_buckets) {
+      reserve_buckets = per_shard;
+    }
+  }
   for (std::size_t i = 0; i < shard_count_; ++i) {
     shards_.push_back(std::make_unique<Shard>(reserve_buckets));
   }

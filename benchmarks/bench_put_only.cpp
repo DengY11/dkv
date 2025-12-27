@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -24,21 +25,21 @@ void EnsureOk(const dkv::Status& s, const std::string& msg) {
   }
 }
 
-std::vector<std::string> MakeStrings(std::size_t n, std::size_t len, char prefix) {
-  std::vector<std::string> out;
-  out.reserve(n);
+void FillStrings(std::vector<std::string>& out, std::size_t start, std::size_t count, std::size_t len,
+                 char prefix) {
+  out.resize(count);
   std::string base(len, prefix);
-  for (std::size_t i = 0; i < n; ++i) {
+  for (std::size_t i = 0; i < count; ++i) {
     auto s = base;
     if (len >= sizeof(std::size_t)) {
-      std::memcpy(&s[len - sizeof(std::size_t)], &i, sizeof(std::size_t));
+      const auto id = start + i;
+      std::memcpy(&s[len - sizeof(std::size_t)], &id, sizeof(std::size_t));
     }
-    out.push_back(std::move(s));
+    out[i].swap(s);
   }
-  return out;
 }
 
-void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len) {
+void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len, std::size_t batch_size) {
   auto dir = TempDir("dkv-put-only");
 
   dkv::Options opts;
@@ -47,19 +48,24 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len) {
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
-  opts.level0_file_limit = 8;
+  opts.level0_file_limit = 12;
   opts.sstable_target_size_bytes = 16 * 1024 * 1024;
 
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv");
 
-  auto keys = MakeStrings(n, key_len, 'k');
-  auto values = MakeStrings(n, value_len, 'v');
+  std::vector<std::string> keys;
+  std::vector<std::string> values;
   dkv::WriteOptions wopts;
 
   auto start = std::chrono::steady_clock::now();
-  for (std::size_t i = 0; i < n; ++i) {
-    EnsureOk(db->Put(wopts, keys[i], values[i]), "put");
+  for (std::size_t i = 0; i < n; i += batch_size) {
+    const auto count = std::min(batch_size, n - i);
+    FillStrings(keys, i, count, key_len, 'k');
+    FillStrings(values, i, count, value_len, 'v');
+    for (std::size_t j = 0; j < count; ++j) {
+      EnsureOk(db->Put(wopts, keys[j], values[j]), "put");
+    }
   }
   auto elapsed_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
@@ -84,7 +90,8 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len) {
 int main() {
   const std::size_t n = 5000000;
   const std::size_t key_len = 16;
-  const std::size_t value_len = 100;
-  BenchPut(n, key_len, value_len);
+  const std::size_t value_len = 16;
+  const std::size_t batch_size = 50000;
+  BenchPut(n, key_len, value_len, batch_size);
   return 0;
 }

@@ -32,7 +32,7 @@ class DB::Impl {
         data_dir_(options_.data_dir),
         wal_path_(data_dir_ / "wal.log"),
         sst_dir_(data_dir_ / "sst"),
-        mem_(std::make_unique<MemTable>(options_.memtable_shard_count)) {}
+        mem_(std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes)) {}
   ~Impl();
 
   Status Init();
@@ -292,7 +292,7 @@ Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string v
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count);
+      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
@@ -318,7 +318,7 @@ Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count);
+      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
@@ -368,7 +368,7 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count);
+      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       Status s = RotateWalLocked(seqs.back(), rotated);
       if (!s.ok()) return s;
@@ -474,7 +474,7 @@ Status DB::Impl::FlushLocked() {
   if (mem_->Empty() && immutables_.empty()) return Status::OK();
   if (!mem_->Empty()) {
     auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>();
+    mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
     std::filesystem::path rotated;
     auto cur = next_seq_.load(std::memory_order_relaxed);
     std::uint64_t max_seq = cur ? cur - 1 : 0;

@@ -32,7 +32,7 @@ struct MemEntryView {
 
 class MemTable {
  public:
-  explicit MemTable(std::size_t shard_count = 16);
+  explicit MemTable(std::size_t shard_count = 16, std::size_t approx_capacity_bytes = 0);
   ~MemTable();
   Status Put(std::uint64_t seq, std::string_view key, std::string_view value);
   Status Delete(std::uint64_t seq, std::string_view key);
