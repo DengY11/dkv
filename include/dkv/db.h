@@ -69,12 +69,9 @@ class DB {
   Status Flush();
   Status Compact();
 
-  // LevelDB-like iterator: supports Seek/Next over the latest visible view.
-  std::unique_ptr<Iterator> Scan(const ReadOptions& options);
+  // supports Seek/Next over the latest visible view (or a snapshot if enabled in ReadOptions).
+  std::unique_ptr<Iterator> Scan(const ReadOptions& options, std::string_view prefix = {});
 
-  // Batch read helper: collects up to limit sorted key/value pairs starting at "from" (inclusive).
-  Status ReadBatch(const ReadOptions& options, std::string_view from, std::size_t limit,
-                   std::vector<std::pair<std::string, std::string>>& out);
   Metrics GetMetrics() const;
 
  private:
@@ -97,6 +94,7 @@ class DB::Iterator {
   std::string_view key() const;
   std::string_view value() const;
   Status status() const;
+  std::string_view prefix() const;
 
  private:
   struct Rep;

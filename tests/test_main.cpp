@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <cstdio>
 #include <iostream>
 #include <random>
 #include <string>
@@ -109,7 +110,7 @@ bool TestCompaction() {
   return true;
 }
 
-bool TestIteratorAndReadBatch() {
+bool TestIteratorAndSnapshot() {
   auto dir = TempDir("dkv-iter");
   dkv::Options opts;
   opts.data_dir = dir;
@@ -144,17 +145,89 @@ bool TestIteratorAndReadBatch() {
     return false;
   }
 
-  // Batch read limited range starting from "b"
-  std::vector<std::pair<std::string, std::string>> batch_out;
-  if (!ExpectOk(db->ReadBatch(ropts, "b", 1, batch_out), "readbatch")) {
+  // Prefix iterator: only keys starting with c
+  auto it_pref = db->Scan(ropts, "c");
+  it_pref->SeekToFirst();
+  std::vector<std::pair<std::string, std::string>> pref_out;
+  while (it_pref->Valid()) {
+    pref_out.emplace_back(std::string(it_pref->key()), std::string(it_pref->value()));
+    it_pref->Next();
+  }
+  if (pref_out.size() != 1 || pref_out[0].first != "c" || pref_out[0].second != "3") {
+    std::cerr << "prefix iterator unexpected results\n";
     std::filesystem::remove_all(dir);
     return false;
   }
-  if (batch_out.size() != 1 || batch_out[0].first != "b" || batch_out[0].second != "2b") {
-    std::cerr << "readbatch unexpected results\n";
+
+  std::filesystem::remove_all(dir);
+  return true;
+}
+
+bool TestSnapshotIsolationAndLargeScan() {
+  auto dir = TempDir("dkv-iter-large");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 64 * 1024;
+  opts.level0_file_limit = 1;  // force compaction when L0 has >1 file
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db iter-large")) return false;
+
+  dkv::WriteOptions wopts;
+  const int kTotal = 2000;
+  for (int i = 0; i < kTotal; ++i) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "k%06d", i);
+    db->Put(wopts, buf, "v" + std::to_string(i));
+  }
+  if (!ExpectOk(db->Flush(), "flush stream-large")) {
     std::filesystem::remove_all(dir);
     return false;
   }
+
+  // Snapshot iterator should be stable even after new writes.
+  dkv::ReadOptions snap_opts;
+  snap_opts.snapshot = true;
+  auto snap_it = db->Scan(snap_opts);
+  db->Put(dkv::WriteOptions{}, "k999999", "late");
+  // Force compaction while snapshot is alive.
+  if (!ExpectOk(db->Compact(), "compact with snapshot")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  std::size_t snap_count = 0;
+  while (snap_it->Valid()) {
+    snap_count++;
+    snap_it->Next();
+  }
+  if (snap_count != static_cast<std::size_t>(kTotal)) {
+    std::cerr << "snapshot iter count mismatch " << snap_count << " expected " << kTotal << "\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  // Non-snapshot iterator should see the extra key.
+  auto it = db->Scan(dkv::ReadOptions{});
+  std::size_t count = 0;
+  while (it->Valid()) {
+    count++;
+    it->Next();
+  }
+  if (count != static_cast<std::size_t>(kTotal + 1)) {
+    std::cerr << "live iter count mismatch " << count << " expected " << kTotal + 1 << "\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  // Explicit snapshot_seq (earlier than latest) should exclude newer writes.
+  dkv::ReadOptions past_opts;
+  past_opts.snapshot_seq = snap_opts.snapshot_seq;  // same as earlier snapshot
+  auto past_it = db->Scan(past_opts);
+  std::size_t past_count = 0;
+  while (past_it->Valid()) {
+    past_count++;
+    past_it->Next();
+  }
+  assert(past_count == snap_count);
 
   std::filesystem::remove_all(dir);
   return true;
@@ -411,7 +484,8 @@ int main() {
   ok &= TestBasicPutGet();
   ok &= TestFlushAndRecover();
   ok &= TestCompaction();
-  ok &= TestIteratorAndReadBatch();
+  ok &= TestIteratorAndSnapshot();
+  ok &= TestSnapshotIsolationAndLargeScan();
   ok &= TestCompressionOption();
   ok &= TestBatchWrite();
   ok &= TestFuzzAgainstModel();

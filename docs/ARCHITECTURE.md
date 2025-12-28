@@ -55,6 +55,7 @@ Background WAL sync: if `wal_sync_interval_ms > 0` and `sync_wal == false`, a th
 - **SSTable blocks**: LevelDB uses restart points for prefix compression inside blocks. DKV stores raw entries (or fully compressed per block with Snappy/Zstd/LZ4 chosen at build time). Index entries include block size (header+payload) and header carries raw/stored sizes and compression code.
 - **Caches/Bloom**: Both use block cache and Bloom filters; DKV also supports a separate Bloom cache that can pin upper-level blooms.
 - **Compaction**: Same leveled model (L0 overlap, L1+ non-overlap). DKV’s compaction is simpler (no partial overlap trimming) and rewrites the manifest after each compaction.
+- **Snapshots**: LevelDB exposes long-lived snapshots that prevent compaction from dropping versions newer than the snapshot sequence. DKV’s `ReadOptions::snapshot`/`snapshot_seq` build a static view at iterator creation time and, while the iterator lives, compaction retains the latest version per key that is ≤ the oldest active snapshot seq. Once all snapshots are released, older versions may be dropped on compaction. There is no explicit snapshot handle API beyond iterator lifetime.
 - **Durability knobs**: Both offer per-write sync; DKV adds optional periodic WAL sync (`wal_sync_interval_ms`).
 
 ## Example

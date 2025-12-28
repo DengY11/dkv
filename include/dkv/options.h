@@ -42,6 +42,10 @@ struct WriteOptions {
 
 struct ReadOptions {
   bool fill_cache{true};
+  // If true, Scan will build a snapshot view at call time (seq <= snapshot_seq).
+  // If snapshot_seq is non-zero, it overrides and uses that sequence boundary.
+  bool snapshot{false};
+  std::uint64_t snapshot_seq{0};
 };
 
 }  // namespace dkv

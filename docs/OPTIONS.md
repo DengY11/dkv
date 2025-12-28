@@ -15,6 +15,7 @@ DKV exposes tuning knobs through `dkv::Options` (compile-time compression backen
 - `level0_file_limit`, `level_base_bytes`, `level_size_multiplier`, `max_levels` – Control compaction pressure. Lower thresholds compact sooner (lower read amp) but increase write amp and CPU. Higher thresholds defer compaction (cheaper writes) but raise read amp and L0 overlap.
 - `data_dir` – Filesystem placement; choose faster storage for better latency.
 - `enable_compress` – Attempts block compression if the binary was built with a backend. Saves space and IO if data is compressible; otherwise falls back to raw blocks per-block. If built with `-DDKV_COMPRESSION=none` or no backend found, this flag has no effect.
+- `ReadOptions::snapshot` / `ReadOptions::snapshot_seq` – If `snapshot=true`, iterator `Scan` builds a static view at the current max sequence; `snapshot_seq` overrides with an explicit sequence upper bound. While snapshots are active, compaction retains the latest version per key that is ≤ the oldest active snapshot seq; once all snapshots are gone, old versions can be dropped.
 
 Compile-time:
 - `-DDKV_COMPRESSION=auto|snappy|zstd|lz4|none` – Chooses the compiled-in backend; see `docs/COMPRESSION.md`.

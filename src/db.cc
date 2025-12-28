@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -29,6 +30,10 @@ struct DB::Iterator::Rep {
   std::vector<std::pair<std::string, std::string>> data;
   std::size_t pos{0};
   Status status{Status::OK()};
+  std::string prefix;
+  std::uint64_t snapshot_seq{0};
+  bool registered{false};
+  Impl* owner{nullptr};
 };
 
 class DB::Impl {
@@ -49,12 +54,11 @@ class DB::Impl {
   Status Get(const ReadOptions& options, std::string_view key, std::string& value);
   Status Flush();
   Status Compact();
-  Status ReadBatch(const ReadOptions& options, std::string_view from, std::size_t limit,
-                   std::vector<std::pair<std::string, std::string>>& out);
-  std::unique_ptr<DB::Iterator> NewIterator(const ReadOptions& options);
+  std::unique_ptr<DB::Iterator> NewIterator(const ReadOptions& options, std::string_view prefix);
   Metrics GetMetrics() const;
 
  private:
+  friend class DB::Iterator;
   struct TableRef;
   struct ImmutableMem;
   void StartWalSyncThread();
@@ -73,6 +77,11 @@ class DB::Impl {
   void FlushThreadLoop();
   void EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
   Status FlushImmutable(const ImmutableMem& imm);
+  Status BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq);
+  std::uint64_t SnapshotSeq(const ReadOptions& options) const;
+  std::uint64_t RegisterSnapshot(std::uint64_t seq);
+  void UnregisterSnapshot(std::uint64_t seq);
+  std::uint64_t MinActiveSnapshot() const;
 
   Options options_;
   std::filesystem::path data_dir_;
@@ -101,6 +110,9 @@ class DB::Impl {
   std::condition_variable wal_sync_cv_;
   std::mutex wal_sync_mu_;
   bool stop_wal_sync_{false};
+
+  mutable std::mutex snapshot_mu_;
+  std::multiset<std::uint64_t> snapshots_;
 
   struct MetricsCounters {
     std::atomic<std::uint64_t> puts{0};
@@ -433,14 +445,31 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
   return Status::NotFound("missing");
 }
 
-Status DB::Impl::ReadBatch(const ReadOptions& /*options*/, std::string_view from, std::size_t limit,
-                           std::vector<std::pair<std::string, std::string>>& out) {
-  if (limit == 0) return Status::OK();
-  std::map<std::string, MemEntry> merged;
-
+Status DB::Impl::BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq) {
   auto mem_entries = mem_->Snapshot();
   for (auto& e : mem_entries) {
-    merged[e.key] = std::move(e);
+    if (e.seq > snapshot_seq) continue;
+    auto it = merged.find(e.key);
+    if (it == merged.end() || it->second.seq < e.seq) {
+      merged[e.key] = std::move(e);
+    }
+  }
+
+  std::vector<std::shared_ptr<ImmutableMem>> imm_copy;
+  {
+    std::shared_lock lk(mu_);
+    imm_copy = immutables_;
+  }
+  for (const auto& imm : imm_copy) {
+    if (!imm || !imm->mem) continue;
+    auto imm_entries = imm->mem->Snapshot();
+    for (auto& e : imm_entries) {
+      if (e.seq > snapshot_seq) continue;
+      auto it = merged.find(e.key);
+      if (it == merged.end() || it->second.seq < e.seq) {
+        merged[e.key] = std::move(e);
+      }
+    }
   }
 
   std::shared_lock lock(sstable_mu_);
@@ -450,6 +479,7 @@ Status DB::Impl::ReadBatch(const ReadOptions& /*options*/, std::string_view from
       Status s = tref.table->LoadAll(entries);
       if (!s.ok()) return s;
       for (auto& e : entries) {
+        if (e.seq > snapshot_seq) continue;
         auto it = merged.find(e.key);
         if (it == merged.end() || it->second.seq < e.seq) {
           merged[e.key] = std::move(e);
@@ -457,51 +487,63 @@ Status DB::Impl::ReadBatch(const ReadOptions& /*options*/, std::string_view from
       }
     }
   }
-
-  auto it = merged.lower_bound(std::string(from));
-  std::size_t added = 0;
-  for (; it != merged.end() && added < limit; ++it) {
-    if (!it->second.deleted) {
-      out.emplace_back(it->first, it->second.value);
-      ++added;
-    }
-  }
-
   return Status::OK();
 }
 
-std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& /*options*/) {
+std::uint64_t DB::Impl::SnapshotSeq(const ReadOptions& options) const {
+  if (options.snapshot_seq != 0) return options.snapshot_seq;
+  if (options.snapshot) {
+    auto seq = next_seq_.load(std::memory_order_relaxed);
+    return seq ? seq - 1 : 0;
+  }
+  return UINT64_MAX;
+}
+
+std::uint64_t DB::Impl::RegisterSnapshot(std::uint64_t seq) {
+  std::lock_guard lk(snapshot_mu_);
+  snapshots_.insert(seq);
+  return seq;
+}
+
+void DB::Impl::UnregisterSnapshot(std::uint64_t seq) {
+  std::lock_guard lk(snapshot_mu_);
+  auto it = snapshots_.find(seq);
+  if (it != snapshots_.end()) snapshots_.erase(it);
+}
+
+std::uint64_t DB::Impl::MinActiveSnapshot() const {
+  std::lock_guard lk(snapshot_mu_);
+  if (snapshots_.empty()) return UINT64_MAX;
+  return *snapshots_.begin();
+}
+
+std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& options, std::string_view prefix) {
+  std::uint64_t snap = SnapshotSeq(options);
   std::map<std::string, MemEntry> merged;
-  auto mem_entries = mem_->Snapshot();
-  for (auto& e : mem_entries) {
-    merged[e.key] = std::move(e);
-  }
-
-  std::shared_lock lock(sstable_mu_);
-  for (const auto& level : levels_) {
-    for (const auto& tref : level) {
-      std::vector<MemEntry> entries;
-      Status s = tref.table->LoadAll(entries);
-      if (!s.ok()) {
-        auto rep = std::make_unique<DB::Iterator::Rep>();
-        rep->status = s;
-        return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
-      }
-      for (auto& e : entries) {
-        auto it = merged.find(e.key);
-        if (it == merged.end() || it->second.seq < e.seq) {
-          merged[e.key] = std::move(e);
-        }
-      }
-    }
-  }
-
+  Status s = BuildMergedView(merged, snap);
   auto rep = std::make_unique<DB::Iterator::Rep>();
+  rep->prefix.assign(prefix);
+  rep->snapshot_seq = snap;
+  if (!s.ok()) {
+    rep->status = s;
+    return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
+  }
+
   rep->data.reserve(merged.size());
   for (auto& kv : merged) {
-    if (!kv.second.deleted) rep->data.emplace_back(std::move(kv.first), std::move(kv.second.value));
+    if (kv.second.deleted) continue;
+    if (!rep->prefix.empty() && kv.first.rfind(rep->prefix, 0) != 0) continue;
+    rep->data.emplace_back(std::move(kv.first), std::move(kv.second.value));
   }
   rep->pos = rep->data.empty() ? rep->data.size() : 0;  // pos==size means invalid; use 0 if non-empty
+  if (options.snapshot || options.snapshot_seq != 0) {
+    rep->registered = true;
+    rep->owner = this;
+    rep->snapshot_seq = RegisterSnapshot(snap);
+  } else {
+    rep->registered = false;
+    rep->owner = this;
+  }
   return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
 }
 
@@ -803,6 +845,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
 
   if (merged_entries.empty()) return Status::OK();
 
+  const std::uint64_t keep_seq = MinActiveSnapshot();
   std::sort(merged_entries.begin(), merged_entries.end(),
             [](const MemEntry& a, const MemEntry& b) {
               if (a.key == b.key) return a.seq > b.seq;
@@ -811,10 +854,19 @@ Status DB::Impl::CompactLevel(std::size_t level) {
   std::vector<MemEntry> compacted;
   compacted.reserve(merged_entries.size());
   std::string current_key;
+  bool kept_snapshot_version = false;
   for (const auto& e : merged_entries) {
     if (compacted.empty() || e.key != current_key) {
       compacted.push_back(e);
       current_key = e.key;
+      kept_snapshot_version = (keep_seq == UINT64_MAX) ? true : (e.seq <= keep_seq);
+      continue;
+    }
+    if (keep_seq == UINT64_MAX) continue;
+    if (kept_snapshot_version) continue;
+    if (e.seq <= keep_seq) {
+      compacted.push_back(e);
+      kept_snapshot_version = true;
     }
   }
 
@@ -976,19 +1028,21 @@ Status DB::Flush() { return impl_->Flush(); }
 
 Status DB::Compact() { return impl_->Compact(); }
 
-std::unique_ptr<DB::Iterator> DB::Scan(const ReadOptions& options) { return impl_->NewIterator(options); }
-
-Status DB::ReadBatch(const ReadOptions& options, std::string_view from, std::size_t limit,
-                     std::vector<std::pair<std::string, std::string>>& out) {
-  return impl_->ReadBatch(options, from, limit, out);
+std::unique_ptr<DB::Iterator> DB::Scan(const ReadOptions& options, std::string_view prefix) {
+  return impl_->NewIterator(options, prefix);
 }
 
 Metrics DB::GetMetrics() const { return impl_->GetMetrics(); }
 
 DB::Iterator::Iterator(std::unique_ptr<Rep> rep) : rep_(std::move(rep)) {}
-DB::Iterator::~Iterator() = default;
-DB::Iterator::Iterator(Iterator&&) noexcept = default;
-DB::Iterator& DB::Iterator::operator=(Iterator&&) noexcept = default;
+DB::Iterator::~Iterator() {
+  if (rep_ && rep_->registered && rep_->owner) {
+    rep_->owner->UnregisterSnapshot(rep_->snapshot_seq);
+    rep_->registered = false;
+  }
+}
+DB::Iterator::Iterator(Iterator&& other) noexcept = default;
+DB::Iterator& DB::Iterator::operator=(Iterator&& other) noexcept = default;
 
 void DB::Iterator::SeekToFirst() {
   if (!rep_ || !rep_->status.ok()) return;
@@ -1001,6 +1055,9 @@ void DB::Iterator::Seek(std::string_view target) {
       rep_->data.begin(), rep_->data.end(), target,
       [](const std::pair<std::string, std::string>& kv, std::string_view t) { return kv.first < t; });
   rep_->pos = static_cast<std::size_t>(std::distance(rep_->data.begin(), it));
+  if (!rep_->prefix.empty() && Valid() && rep_->data[rep_->pos].first.rfind(rep_->prefix, 0) != 0) {
+    rep_->pos = rep_->data.size();
+  }
 }
 
 bool DB::Iterator::Valid() const {
@@ -1009,6 +1066,11 @@ bool DB::Iterator::Valid() const {
 
 void DB::Iterator::Next() {
   if (Valid()) ++rep_->pos;
+  if (!rep_->prefix.empty()) {
+    while (Valid() && rep_->data[rep_->pos].first.rfind(rep_->prefix, 0) != 0) {
+      rep_->pos = rep_->data.size();
+    }
+  }
 }
 
 std::string_view DB::Iterator::key() const {
@@ -1024,6 +1086,11 @@ std::string_view DB::Iterator::value() const {
 Status DB::Iterator::status() const {
   if (!rep_) return Status::IOError("iterator not initialized");
   return rep_->status;
+}
+
+std::string_view DB::Iterator::prefix() const {
+  if (!rep_) return {};
+  return rep_->prefix;
 }
 
 }  // namespace dkv
