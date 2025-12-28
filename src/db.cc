@@ -25,6 +25,12 @@
 
 namespace dkv {
 
+struct DB::Iterator::Rep {
+  std::vector<std::pair<std::string, std::string>> data;
+  std::size_t pos{0};
+  Status status{Status::OK()};
+};
+
 class DB::Impl {
  public:
   explicit Impl(Options options)
@@ -43,8 +49,9 @@ class DB::Impl {
   Status Get(const ReadOptions& options, std::string_view key, std::string& value);
   Status Flush();
   Status Compact();
-  Status Scan(const ReadOptions& options, std::string_view from, std::size_t limit,
-              std::vector<std::pair<std::string, std::string>>& out);
+  Status ReadBatch(const ReadOptions& options, std::string_view from, std::size_t limit,
+                   std::vector<std::pair<std::string, std::string>>& out);
+  std::unique_ptr<DB::Iterator> NewIterator(const ReadOptions& options);
   Metrics GetMetrics() const;
 
  private:
@@ -426,8 +433,8 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
   return Status::NotFound("missing");
 }
 
-Status DB::Impl::Scan(const ReadOptions& /*options*/, std::string_view from, std::size_t limit,
-                      std::vector<std::pair<std::string, std::string>>& out) {
+Status DB::Impl::ReadBatch(const ReadOptions& /*options*/, std::string_view from, std::size_t limit,
+                           std::vector<std::pair<std::string, std::string>>& out) {
   if (limit == 0) return Status::OK();
   std::map<std::string, MemEntry> merged;
 
@@ -461,6 +468,41 @@ Status DB::Impl::Scan(const ReadOptions& /*options*/, std::string_view from, std
   }
 
   return Status::OK();
+}
+
+std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& /*options*/) {
+  std::map<std::string, MemEntry> merged;
+  auto mem_entries = mem_->Snapshot();
+  for (auto& e : mem_entries) {
+    merged[e.key] = std::move(e);
+  }
+
+  std::shared_lock lock(sstable_mu_);
+  for (const auto& level : levels_) {
+    for (const auto& tref : level) {
+      std::vector<MemEntry> entries;
+      Status s = tref.table->LoadAll(entries);
+      if (!s.ok()) {
+        auto rep = std::make_unique<DB::Iterator::Rep>();
+        rep->status = s;
+        return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
+      }
+      for (auto& e : entries) {
+        auto it = merged.find(e.key);
+        if (it == merged.end() || it->second.seq < e.seq) {
+          merged[e.key] = std::move(e);
+        }
+      }
+    }
+  }
+
+  auto rep = std::make_unique<DB::Iterator::Rep>();
+  rep->data.reserve(merged.size());
+  for (auto& kv : merged) {
+    if (!kv.second.deleted) rep->data.emplace_back(std::move(kv.first), std::move(kv.second.value));
+  }
+  rep->pos = rep->data.empty() ? rep->data.size() : 0;  // pos==size means invalid; use 0 if non-empty
+  return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
 }
 
 Status DB::Impl::Flush() {
@@ -934,11 +976,54 @@ Status DB::Flush() { return impl_->Flush(); }
 
 Status DB::Compact() { return impl_->Compact(); }
 
-Status DB::Scan(const ReadOptions& options, std::string_view from, std::size_t limit,
-                std::vector<std::pair<std::string, std::string>>& out) {
-  return impl_->Scan(options, from, limit, out);
+std::unique_ptr<DB::Iterator> DB::Scan(const ReadOptions& options) { return impl_->NewIterator(options); }
+
+Status DB::ReadBatch(const ReadOptions& options, std::string_view from, std::size_t limit,
+                     std::vector<std::pair<std::string, std::string>>& out) {
+  return impl_->ReadBatch(options, from, limit, out);
 }
 
 Metrics DB::GetMetrics() const { return impl_->GetMetrics(); }
+
+DB::Iterator::Iterator(std::unique_ptr<Rep> rep) : rep_(std::move(rep)) {}
+DB::Iterator::~Iterator() = default;
+DB::Iterator::Iterator(Iterator&&) noexcept = default;
+DB::Iterator& DB::Iterator::operator=(Iterator&&) noexcept = default;
+
+void DB::Iterator::SeekToFirst() {
+  if (!rep_ || !rep_->status.ok()) return;
+  rep_->pos = rep_->data.empty() ? rep_->data.size() : 0;
+}
+
+void DB::Iterator::Seek(std::string_view target) {
+  if (!rep_ || !rep_->status.ok()) return;
+  auto it = std::lower_bound(
+      rep_->data.begin(), rep_->data.end(), target,
+      [](const std::pair<std::string, std::string>& kv, std::string_view t) { return kv.first < t; });
+  rep_->pos = static_cast<std::size_t>(std::distance(rep_->data.begin(), it));
+}
+
+bool DB::Iterator::Valid() const {
+  return rep_ && rep_->status.ok() && rep_->pos < rep_->data.size();
+}
+
+void DB::Iterator::Next() {
+  if (Valid()) ++rep_->pos;
+}
+
+std::string_view DB::Iterator::key() const {
+  if (!Valid()) return {};
+  return rep_->data[rep_->pos].first;
+}
+
+std::string_view DB::Iterator::value() const {
+  if (!Valid()) return {};
+  return rep_->data[rep_->pos].second;
+}
+
+Status DB::Iterator::status() const {
+  if (!rep_) return Status::IOError("iterator not initialized");
+  return rep_->status;
+}
 
 }  // namespace dkv

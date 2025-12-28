@@ -56,6 +56,8 @@ class DB {
   DB(const DB&) = delete;
   DB& operator=(const DB&) = delete;
 
+  class Iterator;
+
   static Status Open(const Options& options, std::unique_ptr<DB>& db);
   ~DB();
 
@@ -67,9 +69,12 @@ class DB {
   Status Flush();
   Status Compact();
 
-  // Collects up to limit sorted key/value pairs starting at "from" (inclusive).
-  Status Scan(const ReadOptions& options, std::string_view from, std::size_t limit,
-              std::vector<std::pair<std::string, std::string>>& out);
+  // LevelDB-like iterator: supports Seek/Next over the latest visible view.
+  std::unique_ptr<Iterator> Scan(const ReadOptions& options);
+
+  // Batch read helper: collects up to limit sorted key/value pairs starting at "from" (inclusive).
+  Status ReadBatch(const ReadOptions& options, std::string_view from, std::size_t limit,
+                   std::vector<std::pair<std::string, std::string>>& out);
   Metrics GetMetrics() const;
 
  private:
@@ -77,6 +82,28 @@ class DB {
 
   class Impl;
   std::unique_ptr<Impl> impl_;
+};
+
+class DB::Iterator {
+ public:
+  Iterator(Iterator&&) noexcept;
+  Iterator& operator=(Iterator&&) noexcept;
+  ~Iterator();
+
+  void SeekToFirst();
+  void Seek(std::string_view target);
+  bool Valid() const;
+  void Next();
+  std::string_view key() const;
+  std::string_view value() const;
+  Status status() const;
+
+ private:
+  struct Rep;
+  explicit Iterator(std::unique_ptr<Rep> rep);
+  std::unique_ptr<Rep> rep_;
+  friend class DB;
+  friend class DB::Impl;
 };
 
 }  // namespace dkv

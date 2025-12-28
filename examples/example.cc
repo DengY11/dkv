@@ -41,12 +41,15 @@ int main() {
   batch.Delete("a");
   db->Write(wopts, batch);
 
-  // Scan from "b", up to 10 entries.
-  std::vector<std::pair<std::string, std::string>> out;
-  db->Scan(ropts, "b", 10, out);
+  // Iterate from "b", up to 10 entries.
+  auto it = db->Scan(ropts);
+  it->Seek("b");
   std::cout << "Scan from b:\n";
-  for (const auto& [k, v] : out) {
-    std::cout << "  " << k << " -> " << v << "\n";
+  int shown = 0;
+  while (it->Valid() && shown < 10) {
+    std::cout << "  " << it->key() << " -> " << it->value() << "\n";
+    it->Next();
+    ++shown;
   }
 
   // Show metrics.

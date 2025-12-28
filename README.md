@@ -7,7 +7,7 @@ An embedded, high performance LSM-tree key-value store. Ships as a static librar
 - SSTables with block index + Bloom filter for faster reads
 - Level-0 fan-in with leveled compaction to deeper levels; file sizes bounded by `sstable_target_size_bytes`
 - Batched writes via `WriteBatch` to amortize WAL fsyncs
-- Simple API for `Put`, `Get`, `Delete`, `Scan`, `Flush`, `Compact`
+- Simple API for `Put`, `Get`, `Delete`, iterator-style `Scan`, bulk `ReadBatch`, `Flush`, `Compact`
 - Library-first design: `#include <dkv/db.h>` and link against `dkv`
 
 ## Build & Run

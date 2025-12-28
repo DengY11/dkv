@@ -109,6 +109,57 @@ bool TestCompaction() {
   return true;
 }
 
+bool TestIteratorAndReadBatch() {
+  auto dir = TempDir("dkv-iter");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 32;
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db iter")) return false;
+
+  dkv::WriteOptions wopts;
+  db->Put(wopts, "a", "1");
+  db->Put(wopts, "b", "2");
+  db->Put(wopts, "c", "3");
+  db->Put(wopts, "b", "2b");  // overwrite
+  db->Delete(wopts, "a");     // tombstone should skip
+
+  dkv::ReadOptions ropts;
+  auto it = db->Scan(ropts);
+  if (!it || !it->status().ok()) {
+    std::cerr << "iterator init failed: " << (it ? it->status().ToString() : "null") << "\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  it->Seek("b");
+  std::vector<std::pair<std::string, std::string>> iter_out;
+  while (it->Valid()) {
+    iter_out.emplace_back(std::string(it->key()), std::string(it->value()));
+    it->Next();
+  }
+  if (iter_out.size() != 2 || iter_out[0].first != "b" || iter_out[0].second != "2b" ||
+      iter_out[1].first != "c" || iter_out[1].second != "3") {
+    std::cerr << "iterator unexpected results\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  // Batch read limited range starting from "b"
+  std::vector<std::pair<std::string, std::string>> batch_out;
+  if (!ExpectOk(db->ReadBatch(ropts, "b", 1, batch_out), "readbatch")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  if (batch_out.size() != 1 || batch_out[0].first != "b" || batch_out[0].second != "2b") {
+    std::cerr << "readbatch unexpected results\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  std::filesystem::remove_all(dir);
+  return true;
+}
+
 bool TestCompressionOption() {
   auto dir = TempDir("dkv-compress");
   dkv::Options opts;
@@ -360,6 +411,7 @@ int main() {
   ok &= TestBasicPutGet();
   ok &= TestFlushAndRecover();
   ok &= TestCompaction();
+  ok &= TestIteratorAndReadBatch();
   ok &= TestCompressionOption();
   ok &= TestBatchWrite();
   ok &= TestFuzzAgainstModel();
