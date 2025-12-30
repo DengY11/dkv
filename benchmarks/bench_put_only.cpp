@@ -88,7 +88,7 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len, std::si
 }  // namespace
 
 int main() {
-  const std::size_t n = 5000000;
+  const std::size_t n = 100000000;
   const std::size_t key_len = 16;
   const std::size_t value_len = 16;
   const std::size_t batch_size = 50000;

@@ -138,6 +138,7 @@ class DB::Impl {
 
   mutable std::shared_mutex sstable_mu_;
   std::vector<std::vector<TableRef>> levels_;  // level 0 may overlap; level>=1 sorted non-overlap.
+  std::vector<std::size_t> next_compact_index_;
 };
 
 Status DB::Impl::Init() {
@@ -243,6 +244,7 @@ Status DB::Impl::LoadSSTables() {
   if (!loaded.empty()) {
     std::unique_lock lock(sstable_mu_);
     levels_ = std::move(loaded);
+    next_compact_index_.assign(levels_.size(), 0);
     return Status::OK();
   }
 
@@ -754,6 +756,7 @@ Status DB::Impl::FlushImmutable(const ImmutableMem& imm) {
   {
     std::unique_lock lock_tables(sstable_mu_);
     if (levels_.empty()) levels_.resize(1);
+    if (next_compact_index_.size() < levels_.size()) next_compact_index_.resize(levels_.size(), 0);
     levels_[0].insert(levels_[0].begin(),
                       TableRef{table, table->min_key(), table->max_key(), table->file_size()});
     std::sort(levels_[0].begin(), levels_[0].end(),
@@ -808,22 +811,37 @@ static bool Overlaps(const std::string& a_min, const std::string& a_max, const s
 
 Status DB::Impl::CompactLevel(std::size_t level) {
   auto start = std::chrono::steady_clock::now();
+  std::fprintf(stderr, "[dkv] compact start level=%zu\n", level);
   std::vector<TableRef> inputs;
   std::vector<TableRef> next_inputs;
   {
     std::unique_lock lock(sstable_mu_);
     if (level >= levels_.size()) return Status::OK();
-    inputs = levels_[level];
-    if (inputs.empty()) return Status::OK();
-    if (level + 1 < levels_.size()) {
-      for (const auto& t : levels_[level + 1]) {
-        for (const auto& in : inputs) {
-          if (Overlaps(t.min_key, t.max_key, in.min_key, in.max_key)) {
-            next_inputs.push_back(t);
-            break;
+    if (levels_[level].empty()) return Status::OK();
+    if (level == 0) {
+      inputs = levels_[level];
+      if (level + 1 < levels_.size()) {
+        for (const auto& t : levels_[level + 1]) {
+          for (const auto& in : inputs) {
+            if (Overlaps(t.min_key, t.max_key, in.min_key, in.max_key)) {
+              next_inputs.push_back(t);
+              break;
+            }
           }
         }
       }
+    } else {
+      if (next_compact_index_.size() <= level) next_compact_index_.resize(level + 1, 0);
+      std::size_t idx = next_compact_index_[level] % levels_[level].size();
+      inputs.push_back(levels_[level][idx]);
+      if (level + 1 < levels_.size()) {
+        for (const auto& t : levels_[level + 1]) {
+          if (Overlaps(t.min_key, t.max_key, inputs[0].min_key, inputs[0].max_key)) {
+            next_inputs.push_back(t);
+          }
+        }
+      }
+      next_compact_index_[level] = (idx + 1) % levels_[level].size();
     }
   }
 
@@ -919,6 +937,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
 
   std::unique_lock lock(sstable_mu_);
   if (levels_.size() <= level + 1) levels_.resize(level + 2);
+  if (next_compact_index_.size() < levels_.size()) next_compact_index_.resize(levels_.size(), 0);
   // Remove old files from level and next.
   auto remove_tables = [](std::vector<TableRef>& vec, const std::vector<TableRef>& to_remove) {
     vec.erase(std::remove_if(vec.begin(), vec.end(),
@@ -936,6 +955,10 @@ Status DB::Impl::CompactLevel(std::size_t level) {
   for (auto& t : outputs) {
     levels_[level + 1].push_back(std::move(t));
     output_bytes += levels_[level + 1].back().size;
+  }
+  // If we removed a single file from level>0, adjust next_compact_index_ bounds.
+  if (level > 0) {
+    if (next_compact_index_[level] >= levels_[level].size()) next_compact_index_[level] = 0;
   }
   if (level + 1 > 0) {
     std::sort(levels_[level + 1].begin(), levels_[level + 1].end(),

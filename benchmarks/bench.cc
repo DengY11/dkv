@@ -40,7 +40,7 @@ struct CrudStats {
 enum class Mode { kSeq, kRand, kBatch, kMt, kSyncSeq, kSyncRand };
 
 struct Args {
-  std::size_t n{1'000'000};
+  std::size_t n{10'000'000};
   std::size_t batch{50'000};
   std::size_t threads{8};
   std::size_t ops_per_thread{200'000};
