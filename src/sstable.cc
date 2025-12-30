@@ -358,7 +358,7 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     if (!ReadU64(in, offset) || !ReadU32(in, size)) {
       return Status::Corruption("bad index offset/size in sstable: " + path.string());
     }
-    index.push_back(BlockIndexEntry{std::move(key), offset, size});
+    index.emplace_back(std::move(key), offset, size);
   }
 
   if (index.empty()) return Status::Corruption("empty index in sstable: " + path.string());

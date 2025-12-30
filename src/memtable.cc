@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <queue>
 #include <utility>
+#include <new>
+#include <vector>
 
 namespace dkv {
 
@@ -20,13 +23,71 @@ struct TransparentEq {
   using is_transparent = void;
   bool operator()(std::string_view a, std::string_view b) const { return a == b; }
 };
+
+class ReusableMonotonicResource : public std::pmr::memory_resource {
+ public:
+  explicit ReusableMonotonicResource(std::size_t block_size, void* initial_buffer, std::size_t initial_size)
+      : block_size_(block_size) {
+    blocks_.push_back(Block{static_cast<std::byte*>(initial_buffer), initial_size, 0, true});
+  }
+
+  void Release() {
+    for (std::size_t i = 0; i < blocks_.size(); ++i) {
+      blocks_[i].offset = 0;
+      if (i > 0 && !blocks_[i].external) {
+        delete[] blocks_[i].data;
+        blocks_[i].data = nullptr;
+        blocks_[i].size = 0;
+      }
+    }
+    if (blocks_.size() > 1) blocks_.resize(1);
+  }
+
+ protected:
+  void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+    for (auto& blk : blocks_) {
+      void* ptr = blk.data + blk.offset;
+      std::size_t space = blk.size - blk.offset;
+      void* aligned = ptr;
+      if (std::align(alignment, bytes, aligned, space)) {
+        blk.offset = static_cast<std::size_t>(static_cast<std::byte*>(aligned) - blk.data) + bytes;
+        return aligned;
+      }
+    }
+    // Need new block
+    std::size_t sz = std::max(block_size_, bytes + alignment);
+    auto* buf = new std::byte[sz];
+    blocks_.push_back(Block{buf, sz, 0, false});
+    void* ptr = buf;
+    std::size_t space = sz;
+    void* aligned = ptr;
+    bool ok = std::align(alignment, bytes, aligned, space);
+    (void)ok;
+    blocks_.back().offset = static_cast<std::size_t>(static_cast<std::byte*>(aligned) - buf) + bytes;
+    return aligned;
+  }
+
+  void do_deallocate(void*, std::size_t, std::size_t) override {}
+  bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+
+ private:
+  struct Block {
+    std::byte* data{nullptr};
+    std::size_t size{0};
+    std::size_t offset{0};
+    bool external{false};
+  };
+
+  std::size_t block_size_;
+  std::vector<Block> blocks_;
+};
 }  // namespace
 
 struct MemTable::Shard {
   explicit Shard(std::size_t reserve_buckets)
-      : buffer_(inline_arena_.data(), inline_arena_.size()),
+      : resource_(kInlineArenaSize, inline_arena_.data(), inline_arena_.size()),
         table_(0, TransparentHash{}, TransparentEq{},
-               std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&buffer_}) {
+               std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&resource_}) {
     if (reserve_buckets > 0) table_.reserve(reserve_buckets);
   }
 
@@ -98,9 +159,9 @@ struct MemTable::Shard {
   void Clear() {
     std::unique_lock lk(mu_);
     table_.clear();
-    buffer_.release();
+    resource_.Release();
     table_ = decltype(table_)(0, TransparentHash{}, TransparentEq{},
-                              std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&buffer_});
+                              std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&resource_});
     memory_usage_ = 0;
   }
 
@@ -117,7 +178,7 @@ struct MemTable::Shard {
   mutable std::shared_mutex mu_;
   static constexpr std::size_t kInlineArenaSize = 256 * 1024;
   alignas(std::max_align_t) std::array<std::byte, kInlineArenaSize> inline_arena_{};
-  std::pmr::monotonic_buffer_resource buffer_;
+  ReusableMonotonicResource resource_;
   std::pmr::unordered_map<std::pmr::string, MemValue, TransparentHash, TransparentEq> table_;
   std::size_t memory_usage_{0};
 };
