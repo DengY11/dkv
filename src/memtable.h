@@ -56,6 +56,9 @@ class MemTable {
   struct Shard;
   std::vector<std::unique_ptr<Shard>> shards_;
   std::size_t shard_count_{16};
+  std::size_t base_usage_{0};
+
+  [[nodiscard]] std::size_t RawMemoryUsage() const;
 };
 
 }  // namespace dkv

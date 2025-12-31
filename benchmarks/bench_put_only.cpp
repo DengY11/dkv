@@ -40,16 +40,19 @@ void FillStrings(std::vector<std::string>& out, std::size_t start, std::size_t c
 }
 
 void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len, std::size_t batch_size) {
-  auto dir = TempDir("dkv-put-only");
+  auto dir = TempDir("dkv-put-only-2");
 
   dkv::Options opts;
   opts.data_dir = dir;
   opts.memtable_soft_limit_bytes = 512 * 1024 * 1024;
   opts.sync_wal = false;
-  opts.sstable_block_size_bytes = 16 * 1024;
+  opts.sstable_block_size_bytes = 64*  1024 * 1024;
   opts.bloom_bits_per_key = 8;
-  opts.level0_file_limit = 12;
-  opts.sstable_target_size_bytes = 16 * 1024 * 1024;
+  opts.level0_file_limit = 4;
+  opts.sstable_target_size_bytes = 256 * 1024 * 1024;
+  opts.flush_thread_count = 2;
+  opts.max_immutable_memtables = 2;
+  opts.compaction_thread_count = 4;
 
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv");

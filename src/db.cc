@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cinttypes>
 #include <filesystem>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <queue>
 #include <shared_mutex>
 #include <set>
 #include <sstream>
@@ -17,12 +19,14 @@
 #include <utility>
 #include <vector>
 #include <atomic>
-
+#include <algorithm>
+#include <deque>
 #include "block_cache.h"
 #include "bloom_cache.h"
 #include "memtable.h"
 #include "sstable.h"
 #include "wal.h"
+#include "util.h"
 
 namespace dkv {
 
@@ -68,20 +72,25 @@ class DB::Impl {
   Status LoadSSTables();
   Status LoadManifest(std::vector<std::vector<TableRef>>& loaded);
   Status WriteManifest();
-  Status MaybeCompactLocked();
   Status CompactLevel(std::size_t level);
   std::uint64_t LevelMaxBytes(std::size_t level) const;
   std::uint64_t LevelBytes(std::size_t level) const;
   Status RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem::path& rotated_path);
   void MaybeScheduleFlush();
   void FlushThreadLoop();
+  void ApplyThreadLoop();
+  void CompactThreadLoop();
   void EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
-  Status FlushImmutable(const ImmutableMem& imm);
+  Status FlushImmutable(const std::shared_ptr<ImmutableMem>& imm);
   Status BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq);
   std::uint64_t SnapshotSeq(const ReadOptions& options) const;
   std::uint64_t RegisterSnapshot(std::uint64_t seq);
   void UnregisterSnapshot(std::uint64_t seq);
   std::uint64_t MinActiveSnapshot() const;
+  void MaybeScheduleCompaction();
+  void EnqueueCompaction(std::size_t level);
+  bool PickCompactionLevel(std::size_t& level);
+  Status WaitForAllCompactions();
 
   Options options_;
   std::filesystem::path data_dir_;
@@ -94,14 +103,43 @@ class DB::Impl {
     std::unique_ptr<MemTable> mem;
     std::filesystem::path wal_path;
     std::uint64_t max_seq{0};
+    bool flushing{false};
+    bool flushed{false};
+    bool applied{false};
   };
-  std::vector<std::shared_ptr<ImmutableMem>> immutables_;
-  std::thread flush_thread_;
+  std::deque<std::shared_ptr<ImmutableMem>> immutables_;
+  std::vector<std::thread> flush_threads_;
   std::condition_variable flush_cv_;
   std::mutex flush_mu_;
   bool stop_flush_{false};
+  std::size_t in_flight_flush_{0};
   std::shared_ptr<BlockCache> block_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
+  std::mutex manifest_mu_;
+  std::atomic<std::uint64_t> manifest_tmp_seq_{0};
+  struct FlushResult {
+    std::vector<TableRef> tables;
+    std::filesystem::path wal_path;
+    std::uint64_t total_bytes{0};
+    std::uint64_t flush_ms{0};
+    std::shared_ptr<ImmutableMem> imm;
+  };
+  std::deque<FlushResult> apply_queue_;
+  std::mutex apply_mu_;
+  std::condition_variable apply_cv_;
+  bool stop_apply_{false};
+  std::thread apply_thread_;
+  bool apply_thread_started_{false};
+  std::atomic<std::size_t> pending_apply_{0};
+  std::vector<std::thread> compact_threads_;
+  std::condition_variable compact_cv_;
+  std::mutex compact_mu_;
+  bool stop_compact_{false};
+  std::deque<std::size_t> compact_queue_;
+  std::size_t compact_inflight_{0};
+  std::vector<bool> compact_scheduled_;
+  mutable std::mutex compact_status_mu_;
+  Status last_compact_status_{Status::OK()};
 
   std::shared_mutex mu_;  // shared for reads/writes; unique for flush/compaction/wal rotation.
   std::atomic<std::uint64_t> next_seq_{1};
@@ -203,7 +241,18 @@ Status DB::Impl::Init() {
   }
   StartWalSyncThread();
   stop_flush_ = false;
-  flush_thread_ = std::thread([this] { FlushThreadLoop(); });
+  const std::size_t flush_threads = std::max<std::size_t>(1, options_.flush_thread_count);
+  for (std::size_t i = 0; i < flush_threads; ++i) {
+    flush_threads_.emplace_back([this] { FlushThreadLoop(); });
+  }
+  stop_apply_ = false;
+  apply_thread_ = std::thread([this] { ApplyThreadLoop(); });
+  apply_thread_started_ = true;
+  stop_compact_ = false;
+  const std::size_t compact_threads = std::max<std::size_t>(1, options_.compaction_thread_count);
+  for (std::size_t i = 0; i < compact_threads; ++i) {
+    compact_threads_.emplace_back([this] { CompactThreadLoop(); });
+  }
   return Status::OK();
 }
 
@@ -448,7 +497,14 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
 }
 
 Status DB::Impl::BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq) {
-  auto mem_entries = mem_->Snapshot();
+  std::vector<MemEntry> mem_entries;
+  std::vector<std::shared_ptr<ImmutableMem>> imm_copy;
+  {
+    std::shared_lock mu_lk(mu_);
+    mem_entries = mem_->Snapshot();
+    std::lock_guard lk(flush_mu_);
+    imm_copy.assign(immutables_.begin(), immutables_.end());
+  }
   for (auto& e : mem_entries) {
     if (e.seq > snapshot_seq) continue;
     auto it = merged.find(e.key);
@@ -457,11 +513,6 @@ Status DB::Impl::BuildMergedView(std::map<std::string, MemEntry>& merged, std::u
     }
   }
 
-  std::vector<std::shared_ptr<ImmutableMem>> imm_copy;
-  {
-    std::shared_lock lk(mu_);
-    imm_copy = immutables_;
-  }
   for (const auto& imm : imm_copy) {
     if (!imm || !imm->mem) continue;
     auto imm_entries = imm->mem->Snapshot();
@@ -552,8 +603,10 @@ std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& options, 
 Status DB::Impl::Flush() {
   std::unique_lock lock(mu_);
   Status s = FlushLocked();
+  lock.unlock();
   if (!s.ok()) return s;
-  return MaybeCompactLocked();
+  MaybeScheduleCompaction();
+  return WaitForAllCompactions();
 }
 
 Status DB::Impl::FlushLocked() {
@@ -569,11 +622,14 @@ Status DB::Impl::FlushLocked() {
     EnqueueImmutable(std::move(imm_mem), max_seq, rotated);
   }
   std::unique_lock lk(flush_mu_);
-  flush_cv_.wait(lk, [this] { return immutables_.empty(); });
+  flush_cv_.wait(lk, [this] {
+    return immutables_.empty() && in_flight_flush_ == 0 && pending_apply_.load(std::memory_order_relaxed) == 0;
+  });
   return Status::OK();
 }
 
 Status DB::Impl::WriteManifest() {
+  std::lock_guard<std::mutex> mlk(manifest_mu_);
   std::vector<std::tuple<std::size_t, std::string, std::string, std::string, std::uint64_t, std::uint64_t>> entries;
   for (std::size_t lvl = 0; lvl < levels_.size(); ++lvl) {
     for (const auto& t : levels_[lvl]) {
@@ -583,7 +639,8 @@ Status DB::Impl::WriteManifest() {
     }
   }
 
-  const auto manifest_tmp = data_dir_ / "MANIFEST.tmp";
+  const auto manifest_tmp =
+      data_dir_ / ("MANIFEST.tmp." + std::to_string(manifest_tmp_seq_.fetch_add(1, std::memory_order_relaxed)));
   const auto manifest = data_dir_ / "MANIFEST";
   {
     std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc);
@@ -670,39 +727,47 @@ std::uint64_t DB::Impl::LevelBytes(std::size_t level) const {
   return total;
 }
 
-Status DB::Impl::MaybeCompactLocked() {
-  while (true) {
-    bool need_l0 = false;
-    bool need_other = false;
-    std::size_t target_level = 0;
-    {
-      std::shared_lock lock(sstable_mu_);
-      if (!levels_.empty() && levels_[0].size() > options_.level0_file_limit) {
-        need_l0 = true;
-      } else {
-        for (std::size_t lvl = 1; lvl < levels_.size(); ++lvl) {
-          if (LevelBytes(lvl) > LevelMaxBytes(lvl)) {
-            need_other = true;
-            target_level = lvl;
-            break;
-          }
-        }
-      }
-    }
-
-    if (need_l0) {
-      auto s = CompactLevel(0);
-      if (!s.ok()) return s;
-      continue;
-    }
-    if (need_other) {
-      auto s = CompactLevel(target_level);
-      if (!s.ok()) return s;
-      continue;
-    }
-    break;
+bool DB::Impl::PickCompactionLevel(std::size_t& target_level) {
+  std::shared_lock lock(sstable_mu_);
+  if (!levels_.empty() && levels_[0].size() > options_.level0_file_limit) {
+    target_level = 0;
+    return true;
   }
-  return Status::OK();
+  for (std::size_t lvl = 1; lvl < levels_.size(); ++lvl) {
+    if (LevelBytes(lvl) > LevelMaxBytes(lvl)) {
+      target_level = lvl;
+      return true;
+    }
+  }
+  return false;
+}
+
+void DB::Impl::EnqueueCompaction(std::size_t level) {
+  std::lock_guard lk(compact_mu_);
+  if (stop_compact_) return;
+  if (compact_scheduled_.size() <= level) compact_scheduled_.resize(level + 1, false);
+  if (compact_scheduled_[level]) return;
+  compact_queue_.push_back(level);
+  compact_scheduled_[level] = true;
+  compact_cv_.notify_one();
+}
+
+void DB::Impl::MaybeScheduleCompaction() {
+  std::size_t level = 0;
+  if (PickCompactionLevel(level)) {
+    EnqueueCompaction(level);
+  }
+}
+
+Status DB::Impl::WaitForAllCompactions() {
+  std::unique_lock lk(compact_mu_);
+  compact_cv_.wait(lk, [this] {
+    if (!compact_queue_.empty() || compact_inflight_ > 0) return false;
+    std::size_t lvl = 0;
+    return !PickCompactionLevel(lvl);
+  });
+  std::lock_guard status_lk(compact_status_mu_);
+  return last_compact_status_;
 }
 
 Status DB::Impl::RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem::path& rotated_path) {
@@ -720,87 +785,205 @@ Status DB::Impl::RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem:
 void DB::Impl::EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq,
                                 std::filesystem::path wal_path) {
   {
-    std::lock_guard lk(flush_mu_);
+    std::unique_lock lk(flush_mu_);
+    flush_cv_.wait(lk, [this] {
+      return stop_flush_ ||
+             (immutables_.size() + in_flight_flush_ < options_.max_immutable_memtables);
+    });
+    if (stop_flush_) return;
     immutables_.push_back(std::make_shared<ImmutableMem>(ImmutableMem{
         std::move(mem), std::move(wal_path), max_seq}));
   }
-  flush_cv_.notify_one();
+  flush_cv_.notify_all();
 }
 
 void DB::Impl::MaybeScheduleFlush() {
   // No-op: flush thread waits on condition variable; notify is done in EnqueueImmutable.
 }
 
-Status DB::Impl::FlushImmutable(const ImmutableMem& imm) {
+Status DB::Impl::FlushImmutable(const std::shared_ptr<ImmutableMem>& imm) {
   auto start = std::chrono::steady_clock::now();
-  auto entries_view = imm.mem->SnapshotViews();
+  auto entries_view = imm->mem->SnapshotViews();
   if (entries_view.empty()) {
-    std::error_code ec;
-    std::filesystem::remove(imm.wal_path, ec);
+    {
+      std::lock_guard lk(apply_mu_);
+      apply_queue_.push_back(FlushResult{{}, imm->wal_path, 0, 0, imm});
+      pending_apply_.fetch_add(1, std::memory_order_relaxed);
+    }
+    apply_cv_.notify_one();
     return Status::OK();
   }
 
-  std::uint64_t max_seq = 0;
-  for (const auto& e : entries_view) max_seq = std::max(max_seq, e.seq);
-  const auto filename = "sst-l0-" + std::to_string(max_seq) + ".sst";
-  const auto path = sst_dir_ / filename;
+  std::vector<TableRef> new_tables;
+  std::uint64_t total_bytes = 0;
+  std::vector<MemEntryView> chunk;
+  std::uint64_t chunk_approx = 0;
+  auto flush_chunk = [&](std::vector<MemEntryView>& data) -> Status {
+    if (data.empty()) return Status::OK();
+    std::uint64_t chunk_max_seq = 0;
+    for (const auto& e : data) chunk_max_seq = std::max(chunk_max_seq, e.seq);
+    const auto filename = "sst-l0-" + std::to_string(chunk_max_seq) + "-" + std::to_string(new_tables.size()) + ".sst";
+    const auto path = sst_dir_ / filename;
 
-  Status s = SSTable::Write(path, entries_view, options_.sstable_block_size_bytes, options_.bloom_bits_per_key,
-                            options_.enable_compress);
-  if (!s.ok()) return s;
+    Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes, options_.bloom_bits_per_key,
+                               options_.enable_compress);
+    if (!ws.ok()) return ws;
 
-  std::shared_ptr<SSTable> table;
-  s = SSTable::Open(path, block_cache_, bloom_cache_, false, table);
-  if (!s.ok()) return s;
+    std::shared_ptr<SSTable> table;
+    ws = SSTable::Open(path, block_cache_, bloom_cache_, false, table);
+    if (!ws.ok()) return ws;
 
-  {
-    std::unique_lock lock_tables(sstable_mu_);
-    if (levels_.empty()) levels_.resize(1);
-    if (next_compact_index_.size() < levels_.size()) next_compact_index_.resize(levels_.size(), 0);
-    levels_[0].insert(levels_[0].begin(),
-                      TableRef{table, table->min_key(), table->max_key(), table->file_size()});
-    std::sort(levels_[0].begin(), levels_[0].end(),
-              [](const TableRef& a, const TableRef& b) { return a.table->max_sequence() > b.table->max_sequence(); });
+    new_tables.push_back(TableRef{table, table->min_key(), table->max_key(), table->file_size()});
+    total_bytes += table->file_size();
+    data.clear();
+    chunk_approx = 0;
+    return Status::OK();
+  };
+
+  for (const auto& e : entries_view) {
+    const std::uint64_t entry_sz = 1 + 8 + 4 + 4 + e.key.size() + e.value.size();
+    chunk.push_back(e);
+    chunk_approx += entry_sz;
+    if (chunk_approx >= options_.sstable_target_size_bytes) {
+      Status ws = flush_chunk(chunk);
+      if (!ws.ok()) return ws;
+    }
   }
-  Status ms = WriteManifest();
+  Status s = flush_chunk(chunk);
+  if (!s.ok()) return s;
+
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
                      .count();
-  metrics_.flushes.fetch_add(1, std::memory_order_relaxed);
-  metrics_.flush_ms.fetch_add(static_cast<std::uint64_t>(elapsed), std::memory_order_relaxed);
-  metrics_.flush_bytes.fetch_add(table->file_size(), std::memory_order_relaxed);
-
-  std::error_code ec;
-  std::filesystem::remove(imm.wal_path, ec);
-
-  // Try to compact while holding mu_ to reuse existing logic; best-effort.
-  std::unique_lock lk(mu_, std::try_to_lock);
-  if (lk.owns_lock()) {
-    MaybeCompactLocked();
+  {
+    std::lock_guard lk(apply_mu_);
+    apply_queue_.push_back(FlushResult{std::move(new_tables), imm->wal_path, total_bytes,
+                                       static_cast<std::uint64_t>(elapsed), imm});
+    pending_apply_.fetch_add(1, std::memory_order_relaxed);
   }
-  return ms;
+  apply_cv_.notify_one();
+  return Status::OK();
 }
 
 void DB::Impl::FlushThreadLoop() {
   while (true) {
     std::shared_ptr<ImmutableMem> imm;
-  {
-    std::unique_lock lk(flush_mu_);
-    flush_cv_.wait(lk, [this] { return stop_flush_ || !immutables_.empty(); });
-    if (stop_flush_ && immutables_.empty()) break;
-    imm = immutables_.front();
-  }
-    Status s = FlushImmutable(*imm);
+    {
+      std::unique_lock lk(flush_mu_);
+      auto has_pending = [this]() {
+        for (const auto& m : immutables_) {
+          if (m && !m->flushing && !m->flushed) return true;
+        }
+        return false;
+      };
+      flush_cv_.wait(lk, [this, &has_pending] { return stop_flush_ || has_pending(); });
+      if (stop_flush_ && !has_pending()) break;
+      for (auto& cand : immutables_) {
+        if (cand && !cand->flushing && !cand->flushed) {
+          imm = cand;
+          cand->flushing = true;
+          ++in_flight_flush_;
+          break;
+        }
+      }
+    }
+    if (!imm) continue;
+    Status s = FlushImmutable(imm);
     if (!s.ok()) {
       // Best-effort log.
       std::cerr << "FlushImmutable failed: " << s.ToString() << "\n";
     }
     {
       std::lock_guard lk(flush_mu_);
-      if (!immutables_.empty()) immutables_.erase(immutables_.begin());
-      if (immutables_.empty()) {
-        flush_cv_.notify_all();
+      imm->flushing = false;
+      if (s.ok()) imm->flushed = true;
+      if (in_flight_flush_ > 0) --in_flight_flush_;
+      flush_cv_.notify_all();
+    }
+  }
+}
+
+void DB::Impl::ApplyThreadLoop() {
+  while (true) {
+    FlushResult res;
+    {
+      std::unique_lock lk(apply_mu_);
+      apply_cv_.wait(lk, [this] { return stop_apply_ || !apply_queue_.empty(); });
+      if (stop_apply_ && apply_queue_.empty()) break;
+      res = std::move(apply_queue_.front());
+      apply_queue_.pop_front();
+    }
+
+    if (!res.tables.empty()) {
+      {
+        std::unique_lock lock_tables(sstable_mu_);
+        if (levels_.empty()) levels_.resize(1);
+        if (next_compact_index_.size() < levels_.size()) next_compact_index_.resize(levels_.size(), 0);
+        for (auto& t : res.tables) {
+          levels_[0].insert(levels_[0].begin(), std::move(t));
+        }
+        std::sort(levels_[0].begin(), levels_[0].end(),
+                  [](const TableRef& a, const TableRef& b) { return a.table->max_sequence() > b.table->max_sequence(); });
+      }
+      Status ms = WriteManifest();
+      if (!ms.ok()) {
+        std::cerr << "WriteManifest failed: " << ms.ToString() << "\n";
+      } else {
+        metrics_.flushes.fetch_add(1, std::memory_order_relaxed);
+        metrics_.flush_ms.fetch_add(res.flush_ms, std::memory_order_relaxed);
+        metrics_.flush_bytes.fetch_add(res.total_bytes, std::memory_order_relaxed);
       }
     }
+    std::error_code ec;
+    std::filesystem::remove(res.wal_path, ec);
+
+    if (res.imm) {
+      std::lock_guard lk(flush_mu_);
+      res.imm->applied = true;
+      res.imm->mem.reset();
+      res.imm->wal_path.clear();
+      immutables_.erase(std::remove_if(immutables_.begin(), immutables_.end(),
+                                       [&](const std::shared_ptr<ImmutableMem>& ptr) {
+                                         return ptr && ptr->applied;
+                                       }),
+                        immutables_.end());
+      flush_cv_.notify_all();
+    }
+
+    pending_apply_.fetch_sub(1, std::memory_order_relaxed);
+    flush_cv_.notify_all();
+
+    MaybeScheduleCompaction();
+  }
+}
+
+void DB::Impl::CompactThreadLoop() {
+  while (true) {
+    std::size_t level = 0;
+    {
+      std::unique_lock lk(compact_mu_);
+      compact_cv_.wait(lk, [this] { return stop_compact_ || !compact_queue_.empty(); });
+      if (stop_compact_ && compact_queue_.empty()) break;
+      level = compact_queue_.front();
+      compact_queue_.pop_front();
+      ++compact_inflight_;
+    }
+
+    Status s = CompactLevel(level);
+    {
+      std::lock_guard status_lk(compact_status_mu_);
+      last_compact_status_ = s;
+    }
+    if (!s.ok()) {
+      std::cerr << "CompactLevel(" << level << ") failed: " << s.ToString() << "\n";
+    }
+
+    {
+      std::lock_guard lk(compact_mu_);
+      if (level < compact_scheduled_.size()) compact_scheduled_[level] = false;
+      if (compact_inflight_ > 0) --compact_inflight_;
+      compact_cv_.notify_all();
+    }
+    MaybeScheduleCompaction();
   }
 }
 
@@ -811,7 +994,6 @@ static bool Overlaps(const std::string& a_min, const std::string& a_max, const s
 
 Status DB::Impl::CompactLevel(std::size_t level) {
   auto start = std::chrono::steady_clock::now();
-  std::fprintf(stderr, "[dkv] compact start level=%zu\n", level);
   std::vector<TableRef> inputs;
   std::vector<TableRef> next_inputs;
   {
@@ -845,89 +1027,147 @@ Status DB::Impl::CompactLevel(std::size_t level) {
     }
   }
 
-  std::vector<MemEntry> merged_entries;
-  merged_entries.reserve(inputs.size() * 16);
+  const std::uint64_t keep_seq = MinActiveSnapshot();
+  struct Cursor {
+    std::shared_ptr<SSTable> table;
+    std::size_t block_idx{0};
+    std::size_t entry_idx{0};
+    std::vector<MemEntry> block;
+  };
 
-  auto load_tables = [&](const std::vector<TableRef>& tables) -> Status {
-    for (const auto& t : tables) {
-      Status s = t.table->LoadAll(merged_entries);
-      if (!s.ok()) return s;
+  auto load_block = [&](Cursor& cur) -> Status {
+    if (cur.block_idx >= cur.table->block_count()) {
+      return Status::NotFound("end");
+    }
+    Status bs = cur.table->ReadBlockByIndex(cur.block_idx, cur.block);
+    if (!bs.ok()) return bs;
+    ++cur.block_idx;
+    cur.entry_idx = 0;
+    return Status::OK();
+  };
+
+  auto next_entry = [&](Cursor& cur, MemEntry& out) -> Status {
+    while (true) {
+      if (cur.entry_idx < cur.block.size()) {
+        out = cur.block[cur.entry_idx++];
+        return Status::OK();
+      }
+      Status ls = load_block(cur);
+      if (ls.code() == Status::Code::kNotFound) return ls;
+      if (!ls.ok()) return ls;
+    }
+  };
+
+  std::vector<Cursor> cursors;
+  cursors.reserve(inputs.size() + next_inputs.size());
+  struct HeapItem {
+    std::string key;
+    MemEntry entry;
+    std::size_t cursor_idx{0};
+  };
+  auto cmp = [](const HeapItem& a, const HeapItem& b) { return a.key > b.key; };
+  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
+
+  auto add_cursor = [&](const TableRef& tref) -> Status {
+    Cursor cur;
+    cur.table = tref.table;
+    MemEntry first;
+    Status ns = next_entry(cur, first);
+    if (ns.code() == Status::Code::kNotFound) return Status::OK();
+    if (!ns.ok()) return ns;
+    const std::size_t idx = cursors.size();
+    cursors.push_back(std::move(cur));
+    heap.push(HeapItem{first.key, std::move(first), idx});
+    return Status::OK();
+  };
+
+  for (const auto& t : inputs) {
+    Status ns = add_cursor(t);
+    if (!ns.ok()) return ns;
+  }
+  for (const auto& t : next_inputs) {
+    Status ns = add_cursor(t);
+    if (!ns.ok()) return ns;
+  }
+
+  if (heap.empty()) return Status::OK();
+
+  std::vector<TableRef> outputs;
+  std::vector<MemEntry> chunk;
+  std::uint64_t approx_size = 0;
+  auto flush_chunk = [&](std::vector<MemEntry>& data) -> Status {
+    if (data.empty()) return Status::OK();
+    std::uint64_t max_seq = 0;
+    for (const auto& e : data) max_seq = std::max(max_seq, e.seq);
+    const auto filename =
+        "sst-l" + std::to_string(level + 1) + "-" + std::to_string(max_seq) + "-" +
+        std::to_string(outputs.size()) + ".sst";
+    const auto path = sst_dir_ / filename;
+    Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes,
+                               options_.bloom_bits_per_key, options_.enable_compress);
+    if (!ws.ok()) return ws;
+    std::shared_ptr<SSTable> t;
+    bool pin_bloom = (level + 1) > 0;
+    ws = SSTable::Open(path, block_cache_, bloom_cache_, pin_bloom, t);
+    if (!ws.ok()) return ws;
+    outputs.push_back(TableRef{t, t->min_key(), t->max_key(), t->file_size()});
+    data.clear();
+    approx_size = 0;
+    return Status::OK();
+  };
+
+  auto add_entry = [&](MemEntry&& e) -> Status {
+    std::uint64_t entry_sz = 1 + 8 + 4 + 4 + e.key.size() + e.value.size();
+    chunk.push_back(std::move(e));
+    approx_size += entry_sz;
+    if (approx_size >= options_.sstable_target_size_bytes) {
+      return flush_chunk(chunk);
     }
     return Status::OK();
   };
 
-  Status s = load_tables(inputs);
-  if (!s.ok()) return s;
-  s = load_tables(next_inputs);
-  if (!s.ok()) return s;
-
-  if (merged_entries.empty()) return Status::OK();
-
-  const std::uint64_t keep_seq = MinActiveSnapshot();
-  std::sort(merged_entries.begin(), merged_entries.end(),
-            [](const MemEntry& a, const MemEntry& b) {
-              if (a.key == b.key) return a.seq > b.seq;
-              return a.key < b.key;
-            });
-  std::vector<MemEntry> compacted;
-  compacted.reserve(merged_entries.size());
-  std::string current_key;
-  bool kept_snapshot_version = false;
-  for (const auto& e : merged_entries) {
-    if (compacted.empty() || e.key != current_key) {
-      compacted.push_back(e);
-      current_key = e.key;
-      kept_snapshot_version = (keep_seq == UINT64_MAX) ? true : (e.seq <= keep_seq);
-      continue;
+  while (!heap.empty()) {
+    const std::string current_key = heap.top().key;
+    std::vector<MemEntry> same_key_entries;
+    while (!heap.empty() && heap.top().key == current_key) {
+      HeapItem item = heap.top();
+      heap.pop();
+      same_key_entries.push_back(std::move(item.entry));
+      MemEntry next;
+      Status ns = next_entry(cursors[item.cursor_idx], next);
+      if (ns.ok()) {
+        heap.push(HeapItem{next.key, std::move(next), item.cursor_idx});
+      } else if (ns.code() != Status::Code::kNotFound) {
+        return ns;
+      }
     }
-    if (keep_seq == UINT64_MAX) continue;
-    if (kept_snapshot_version) continue;
-    if (e.seq <= keep_seq) {
-      compacted.push_back(e);
-      kept_snapshot_version = true;
+
+    if (same_key_entries.empty()) continue;
+    std::size_t newest_idx = 0;
+    std::size_t snapshot_idx = same_key_entries.size();
+    for (std::size_t i = 0; i < same_key_entries.size(); ++i) {
+      if (same_key_entries[i].seq > same_key_entries[newest_idx].seq) {
+        newest_idx = i;
+      }
+      if (keep_seq != UINT64_MAX && same_key_entries[i].seq <= keep_seq) {
+        if (snapshot_idx == same_key_entries.size() ||
+            same_key_entries[i].seq > same_key_entries[snapshot_idx].seq) {
+          snapshot_idx = i;
+        }
+      }
+    }
+
+    Status add_newest = add_entry(std::move(same_key_entries[newest_idx]));
+    if (!add_newest.ok()) return add_newest;
+
+    if (keep_seq != UINT64_MAX && same_key_entries[newest_idx].seq > keep_seq &&
+        snapshot_idx < same_key_entries.size()) {
+      Status add_snapshot = add_entry(std::move(same_key_entries[snapshot_idx]));
+      if (!add_snapshot.ok()) return add_snapshot;
     }
   }
 
-  auto write_outputs = [&](const std::vector<MemEntry>& entries_out, std::size_t target_level,
-                           std::vector<TableRef>& out_tables) -> Status {
-    if (entries_out.empty()) return Status::OK();
-    std::vector<MemEntry> chunk;
-    std::uint64_t approx_size = 0;
-    auto flush_chunk = [&](std::vector<MemEntry>& chunk_data) -> Status {
-      if (chunk_data.empty()) return Status::OK();
-      std::uint64_t max_seq = 0;
-      for (const auto& e : chunk_data) max_seq = std::max(max_seq, e.seq);
-      const auto filename =
-          "sst-l" + std::to_string(target_level) + "-" + std::to_string(max_seq) + "-" +
-          std::to_string(out_tables.size()) + ".sst";
-      const auto path = sst_dir_ / filename;
-      Status ws = SSTable::Write(path, chunk_data, options_.sstable_block_size_bytes,
-                                 options_.bloom_bits_per_key, options_.enable_compress);
-      if (!ws.ok()) return ws;
-      std::shared_ptr<SSTable> t;
-      bool pin_bloom = target_level > 0;
-      ws = SSTable::Open(path, block_cache_, bloom_cache_, pin_bloom, t);
-      if (!ws.ok()) return ws;
-      out_tables.push_back(TableRef{t, t->min_key(), t->max_key(), t->file_size()});
-      chunk_data.clear();
-      approx_size = 0;
-      return Status::OK();
-    };
-
-    for (const auto& e : entries_out) {
-      std::uint64_t entry_sz = 1 + 8 + 4 + 4 + e.key.size() + e.value.size();
-      chunk.push_back(e);
-      approx_size += entry_sz;
-      if (approx_size >= options_.sstable_target_size_bytes) {
-        Status fs = flush_chunk(chunk);
-        if (!fs.ok()) return fs;
-      }
-    }
-    return flush_chunk(chunk);
-  };
-
-  std::vector<TableRef> outputs;
-  s = write_outputs(compacted, level + 1, outputs);
+  Status s = flush_chunk(chunk);
   if (!s.ok()) return s;
 
   std::uint64_t input_bytes = 0;
@@ -986,10 +1226,11 @@ Status DB::Impl::CompactLevel(std::size_t level) {
 
 Status DB::Impl::Compact() {
   std::unique_lock lock(mu_);
-  // Flush memtable first to simplify compaction.
   Status s = FlushLocked();
+  lock.unlock();
   if (!s.ok()) return s;
-  return MaybeCompactLocked();
+  MaybeScheduleCompaction();
+  return WaitForAllCompactions();
 }
 
 Metrics DB::Impl::GetMetrics() const {
@@ -1012,15 +1253,31 @@ Metrics DB::Impl::GetMetrics() const {
 DB::DB(Options options) : impl_(new Impl(std::move(options))) {}
 DB::~DB() = default;
 
-DB::Impl::~Impl() {
-  {
-    std::lock_guard lk(flush_mu_);
-    stop_flush_ = true;
+  DB::Impl::~Impl() {
+    {
+      std::lock_guard lk(flush_mu_);
+      stop_flush_ = true;
+    }
+    flush_cv_.notify_all();
+    for (auto& th : flush_threads_) {
+      if (th.joinable()) th.join();
+    }
+    {
+      std::lock_guard lk(apply_mu_);
+      stop_apply_ = true;
+    }
+    apply_cv_.notify_all();
+    if (apply_thread_started_ && apply_thread_.joinable()) apply_thread_.join();
+    {
+      std::lock_guard lk(compact_mu_);
+      stop_compact_ = true;
+    }
+    compact_cv_.notify_all();
+    for (auto& th : compact_threads_) {
+      if (th.joinable()) th.join();
+    }
+    StopWalSyncThread();
   }
-  flush_cv_.notify_all();
-  if (flush_thread_.joinable()) flush_thread_.join();
-  StopWalSyncThread();
-}
 
 Status DB::Open(const Options& options, std::unique_ptr<DB>& db) {
   auto impl = std::make_unique<Impl>(options);

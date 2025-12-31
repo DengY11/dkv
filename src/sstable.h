@@ -38,6 +38,8 @@ class SSTable {
   [[nodiscard]] const std::string& min_key() const { return min_key_; }
   [[nodiscard]] const std::string& max_key() const { return max_key_; }
   [[nodiscard]] std::uint64_t file_size() const { return file_size_; }
+  [[nodiscard]] std::size_t block_count() const { return blocks_.size(); }
+  Status ReadBlockByIndex(std::size_t index, std::vector<MemEntry>& out) const;
 
  private:
   struct BlockIndexEntry {

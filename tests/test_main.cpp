@@ -49,6 +49,7 @@ bool TestBasicPutGet() {
   auto s = db->Get(dkv::ReadOptions{}, "foo", value);
   assert(!s.ok() && s.code() == dkv::Status::Code::kNotFound);
 
+  db.reset();
   std::filesystem::remove_all(dir);
   return true;
 }
@@ -80,6 +81,7 @@ bool TestFlushAndRecover() {
     assert(value == "v" + std::to_string(i));
   }
 
+  db2.reset();
   std::filesystem::remove_all(dir);
   return true;
 }
@@ -106,6 +108,7 @@ bool TestCompaction() {
   auto s = db->Get(dkv::ReadOptions{}, "beta", value);
   assert(!s.ok() && s.code() == dkv::Status::Code::kNotFound);
 
+  db.reset();
   std::filesystem::remove_all(dir);
   return true;
 }
@@ -116,7 +119,15 @@ bool TestIteratorAndSnapshot() {
   opts.data_dir = dir;
   opts.memtable_soft_limit_bytes = 32;
   std::unique_ptr<dkv::DB> db;
+  std::unique_ptr<dkv::DB::Iterator> it;
+  std::unique_ptr<dkv::DB::Iterator> it_pref;
   if (!ExpectOk(dkv::DB::Open(opts, db), "open db iter")) return false;
+  auto cleanup = [&]() {
+    it.reset();
+    it_pref.reset();
+    db.reset();
+    std::filesystem::remove_all(dir);
+  };
 
   dkv::WriteOptions wopts;
   db->Put(wopts, "a", "1");
@@ -126,10 +137,10 @@ bool TestIteratorAndSnapshot() {
   db->Delete(wopts, "a");     // tombstone should skip
 
   dkv::ReadOptions ropts;
-  auto it = db->Scan(ropts);
+  it = db->Scan(ropts);
   if (!it || !it->status().ok()) {
     std::cerr << "iterator init failed: " << (it ? it->status().ToString() : "null") << "\n";
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
   it->Seek("b");
@@ -141,12 +152,12 @@ bool TestIteratorAndSnapshot() {
   if (iter_out.size() != 2 || iter_out[0].first != "b" || iter_out[0].second != "2b" ||
       iter_out[1].first != "c" || iter_out[1].second != "3") {
     std::cerr << "iterator unexpected results\n";
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
 
   // Prefix iterator: only keys starting with c
-  auto it_pref = db->Scan(ropts, "c");
+  it_pref = db->Scan(ropts, "c");
   it_pref->SeekToFirst();
   std::vector<std::pair<std::string, std::string>> pref_out;
   while (it_pref->Valid()) {
@@ -155,11 +166,11 @@ bool TestIteratorAndSnapshot() {
   }
   if (pref_out.size() != 1 || pref_out[0].first != "c" || pref_out[0].second != "3") {
     std::cerr << "prefix iterator unexpected results\n";
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
 
-  std::filesystem::remove_all(dir);
+  cleanup();
   return true;
 }
 
@@ -167,10 +178,20 @@ bool TestSnapshotIsolationAndLargeScan() {
   auto dir = TempDir("dkv-iter-large");
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 64 * 1024;
+  opts.memtable_soft_limit_bytes = 4 * 1024 * 1024;
   opts.level0_file_limit = 1;  // force compaction when L0 has >1 file
   std::unique_ptr<dkv::DB> db;
+  std::unique_ptr<dkv::DB::Iterator> snap_it;
+  std::unique_ptr<dkv::DB::Iterator> it;
+  std::unique_ptr<dkv::DB::Iterator> past_it;
   if (!ExpectOk(dkv::DB::Open(opts, db), "open db iter-large")) return false;
+  auto cleanup = [&]() {
+    snap_it.reset();
+    it.reset();
+    past_it.reset();
+    db.reset();
+    std::filesystem::remove_all(dir);
+  };
 
   dkv::WriteOptions wopts;
   const int kTotal = 2000;
@@ -180,18 +201,18 @@ bool TestSnapshotIsolationAndLargeScan() {
     db->Put(wopts, buf, "v" + std::to_string(i));
   }
   if (!ExpectOk(db->Flush(), "flush stream-large")) {
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
 
   // Snapshot iterator should be stable even after new writes.
   dkv::ReadOptions snap_opts;
   snap_opts.snapshot = true;
-  auto snap_it = db->Scan(snap_opts);
+  snap_it = db->Scan(snap_opts);
   db->Put(dkv::WriteOptions{}, "k999999", "late");
   // Force compaction while snapshot is alive.
   if (!ExpectOk(db->Compact(), "compact with snapshot")) {
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
   std::size_t snap_count = 0;
@@ -201,12 +222,12 @@ bool TestSnapshotIsolationAndLargeScan() {
   }
   if (snap_count != static_cast<std::size_t>(kTotal)) {
     std::cerr << "snapshot iter count mismatch " << snap_count << " expected " << kTotal << "\n";
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
 
   // Non-snapshot iterator should see the extra key.
-  auto it = db->Scan(dkv::ReadOptions{});
+  it = db->Scan(dkv::ReadOptions{});
   std::size_t count = 0;
   while (it->Valid()) {
     count++;
@@ -214,14 +235,14 @@ bool TestSnapshotIsolationAndLargeScan() {
   }
   if (count != static_cast<std::size_t>(kTotal + 1)) {
     std::cerr << "live iter count mismatch " << count << " expected " << kTotal + 1 << "\n";
-    std::filesystem::remove_all(dir);
+    cleanup();
     return false;
   }
 
   // Explicit snapshot_seq (earlier than latest) should exclude newer writes.
   dkv::ReadOptions past_opts;
   past_opts.snapshot_seq = snap_opts.snapshot_seq;  // same as earlier snapshot
-  auto past_it = db->Scan(past_opts);
+  past_it = db->Scan(past_opts);
   std::size_t past_count = 0;
   while (past_it->Valid()) {
     past_count++;
@@ -229,7 +250,7 @@ bool TestSnapshotIsolationAndLargeScan() {
   }
   assert(past_count == snap_count);
 
-  std::filesystem::remove_all(dir);
+  cleanup();
   return true;
 }
 
@@ -252,15 +273,29 @@ bool TestCompressionOption() {
 
   std::unique_ptr<dkv::DB> db2;
   if (!ExpectOk(dkv::DB::Open(opts, db2), "reopen compress")) return false;
+  auto cleanup = [&]() {
+    db.reset();
+    db2.reset();
+    std::filesystem::remove_all(dir);
+  };
   std::string value;
-  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c1", value), "get c1")) return false;
+  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c1", value), "get c1")) {
+    cleanup();
+    return false;
+  }
   assert(value == std::string(64, 'a'));
-  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c2", value), "get c2")) return false;
+  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c2", value), "get c2")) {
+    cleanup();
+    return false;
+  }
   assert(value == std::string(128, 'b'));
-  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c3", value), "get c3")) return false;
+  if (!ExpectOk(db2->Get(dkv::ReadOptions{}, "c3", value), "get c3")) {
+    cleanup();
+    return false;
+  }
   assert(value == std::string(16, 'c'));
 
-  std::filesystem::remove_all(dir);
+  cleanup();
   return true;
 }
 
@@ -270,6 +305,10 @@ bool TestBatchWrite() {
   opts.data_dir = dir;
   std::unique_ptr<dkv::DB> db;
   if (!ExpectOk(dkv::DB::Open(opts, db), "open db")) return false;
+  auto cleanup = [&]() {
+    db.reset();
+    std::filesystem::remove_all(dir);
+  };
 
   dkv::WriteBatch batch;
   batch.Put("a", "1");
@@ -278,14 +317,20 @@ bool TestBatchWrite() {
   batch.Put("a", "3");
   batch.Delete("b");
 
-  if (!ExpectOk(db->Write(dkv::WriteOptions{}, batch), "write batch")) return false;
+  if (!ExpectOk(db->Write(dkv::WriteOptions{}, batch), "write batch")) {
+    cleanup();
+    return false;
+  }
   std::string value;
-  if (!ExpectOk(db->Get(dkv::ReadOptions{}, "a", value), "get a batch")) return false;
+  if (!ExpectOk(db->Get(dkv::ReadOptions{}, "a", value), "get a batch")) {
+    cleanup();
+    return false;
+  }
   assert(value == "3");
   auto s = db->Get(dkv::ReadOptions{}, "b", value);
   assert(!s.ok() && s.code() == dkv::Status::Code::kNotFound);
 
-  std::filesystem::remove_all(dir);
+  cleanup();
   return true;
 }
 
@@ -306,6 +351,10 @@ bool TestFuzzAgainstModel() {
   opts.memtable_soft_limit_bytes = 256 * 1024;
   std::unique_ptr<dkv::DB> db;
   if (!ExpectOk(dkv::DB::Open(opts, db), "open db")) return false;
+  auto cleanup = [&]() {
+    db.reset();
+    std::filesystem::remove_all(dir);
+  };
 
   std::mt19937_64 rng(123456789);
   std::uniform_int_distribution<int> op_dist(0, 2);  // 0=put,1=del,2=get
@@ -365,7 +414,7 @@ bool TestFuzzAgainstModel() {
     assert(value == kv.second);
   }
 
-  std::filesystem::remove_all(dir);
+  cleanup();
   return true;
 }
 
@@ -376,6 +425,7 @@ bool TestFuzzWithReopen() {
   opts.memtable_soft_limit_bytes = 64 * 1024;  // trigger flushes
   opts.sync_wal = false;
   opts.wal_sync_interval_ms = 0;
+  auto cleanup_dir = [&]() { std::filesystem::remove_all(dir); };
 
   std::mt19937_64 rng(424242);
   std::uniform_int_distribution<int> op_dist(0, 2);   // 0=put,1=del,2=get
@@ -452,7 +502,7 @@ bool TestFuzzWithReopen() {
   // multiple rounds with reopen between
   for (int round = 0; round < 3; ++round) {
     if (!run_round(800, round)) {
-      std::filesystem::remove_all(dir);
+      cleanup_dir();
       return false;
     }
   }
@@ -460,20 +510,22 @@ bool TestFuzzWithReopen() {
   // Final full validation after last reopen
   std::unique_ptr<dkv::DB> db;
   if (!ExpectOk(dkv::DB::Open(opts, db), "open db final verify")) {
-    std::filesystem::remove_all(dir);
+    cleanup_dir();
     return false;
   }
   dkv::ReadOptions ropts;
   for (const auto& kv : model) {
     std::string value;
     if (!ExpectOk(db->Get(ropts, kv.first, value), "final verify get")) {
-      std::filesystem::remove_all(dir);
+      db.reset();
+      cleanup_dir();
       return false;
     }
     assert(value == kv.second);
   }
 
-  std::filesystem::remove_all(dir);
+  db.reset();
+  cleanup_dir();
   return true;
 }
 

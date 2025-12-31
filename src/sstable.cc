@@ -451,6 +451,15 @@ Status SSTable::LoadAll(std::vector<MemEntry>& out) const {
   return Status::OK();
 }
 
+Status SSTable::ReadBlockByIndex(std::size_t index, std::vector<MemEntry>& out) const {
+  if (index >= blocks_.size()) return Status::InvalidArgument("block index out of range");
+  out.clear();
+  if (!ReadBlock(blocks_[index].offset, blocks_[index].size, out)) {
+    return Status::Corruption("failed to read block: " + path_.string());
+  }
+  return Status::OK();
+}
+
 Status SSTable::Scan(std::string_view from, std::size_t limit,
                      std::vector<std::pair<std::string, std::string>>& out) const {
   if (limit == 0) return Status::OK();
