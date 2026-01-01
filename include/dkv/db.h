@@ -49,6 +49,14 @@ struct Metrics {
   std::uint64_t compaction_output_bytes{0};
 
   std::uint64_t wal_syncs{0};
+
+  // Cache-level metrics
+  std::uint64_t block_cache_hits{0};
+  std::uint64_t block_cache_misses{0};
+  std::uint64_t block_cache_puts{0};
+  std::uint64_t block_cache_evictions{0};
+  std::uint64_t block_cache_used_bytes{0};
+  std::uint64_t block_cache_capacity_bytes{0};
 };
 
 class DB {

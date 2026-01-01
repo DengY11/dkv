@@ -111,13 +111,18 @@ CrudStats BenchDKVSingle(const Args& args, Mode mode) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 512 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 128 * 1024 * 1024;
   opts.sync_wal = sync;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
-  opts.level0_file_limit = 8;
-  opts.sstable_target_size_bytes = 16 * 1024 * 1024;
+  opts.level0_file_limit = 4;
+  opts.sstable_target_size_bytes = 64 * 1024 * 1024;
+  opts.max_immutable_memtables = 4;
+  opts.flush_thread_count = 4;
+  opts.compaction_thread_count = 3;
+  opts.block_cache_capacity_bytes = 1024 * 1024 * 1024;
   opts.wal_sync_interval_ms = sync ? 0 : 5;
+  opts.bloom_cache_capacity_bytes = 512 * 1024 * 1024;
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv");
 
@@ -164,7 +169,24 @@ CrudStats BenchDKVSingle(const Args& args, Mode mode) {
                      std::chrono::steady_clock::now() - start_put)
                      .count();
 
+  // Settle background work before timed reads.
+  EnsureOk(db->Flush(), "dkv flush before read bench");
+  EnsureOk(db->Compact(), "dkv compact before read bench");
+
+  // Warm cache once (not timed).
+  auto rng_get_warm = rng_get;
   std::string value;
+  run_loop('v', rng_get_warm, [&](std::size_t count) {
+    (void)count;
+    for (std::size_t j = 0; j < keys.size(); ++j) {
+      auto s = db->Get(ropts, keys[j], value);
+      if (!s.ok() && !(random && s.code() == dkv::Status::Code::kNotFound)) {
+        EnsureOk(s, "dkv warm get");
+      }
+    }
+  });
+
+  // Timed reads.
   auto start_get = std::chrono::steady_clock::now();
   run_loop('v', rng_get, [&](std::size_t count) {
     (void)count;

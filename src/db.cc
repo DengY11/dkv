@@ -187,6 +187,13 @@ Status DB::Impl::Init() {
   Status s = wal_->Open();
   if (!s.ok()) return s;
 
+  if (options_.block_cache_capacity_bytes > 0) {
+    block_cache_ = std::make_shared<BlockCache>(options_.block_cache_capacity_bytes);
+  }
+  if (options_.bloom_cache_capacity_bytes > 0) {
+    bloom_cache_ = std::make_shared<BloomCache>(options_.bloom_cache_capacity_bytes);
+  }
+
   s = LoadSSTables();
   if (!s.ok()) return s;
 
@@ -233,12 +240,6 @@ Status DB::Impl::Init() {
   }
 
   next_seq_.store(max_seq_seen + 1, std::memory_order_relaxed);
-  if (options_.block_cache_capacity_bytes > 0) {
-    block_cache_ = std::make_shared<BlockCache>(options_.block_cache_capacity_bytes);
-  }
-  if (options_.bloom_cache_capacity_bytes > 0) {
-    bloom_cache_ = std::make_shared<BloomCache>(options_.bloom_cache_capacity_bytes);
-  }
   StartWalSyncThread();
   stop_flush_ = false;
   const std::size_t flush_threads = std::max<std::size_t>(1, options_.flush_thread_count);
@@ -1247,6 +1248,15 @@ Metrics DB::Impl::GetMetrics() const {
   m.compaction_input_bytes = metrics_.compaction_input_bytes.load(std::memory_order_relaxed);
   m.compaction_output_bytes = metrics_.compaction_output_bytes.load(std::memory_order_relaxed);
   m.wal_syncs = metrics_.wal_syncs.load(std::memory_order_relaxed);
+  if (block_cache_) {
+    auto stats = block_cache_->GetStats();
+    m.block_cache_hits = stats.hits;
+    m.block_cache_misses = stats.misses;
+    m.block_cache_puts = stats.puts;
+    m.block_cache_evictions = stats.evictions;
+    m.block_cache_used_bytes = stats.used_bytes;
+    m.block_cache_capacity_bytes = stats.capacity_bytes;
+  }
   return m;
 }
 

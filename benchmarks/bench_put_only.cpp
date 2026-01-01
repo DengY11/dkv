@@ -52,7 +52,7 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len, std::si
   opts.sstable_target_size_bytes = 256 * 1024 * 1024;
   opts.flush_thread_count = 2;
   opts.max_immutable_memtables = 2;
-  opts.compaction_thread_count = 4;
+  opts.compaction_thread_count = 3;
 
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv");
