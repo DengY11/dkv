@@ -32,15 +32,23 @@ class ReusableMonotonicResource : public std::pmr::memory_resource {
   }
 
   void Release() {
-    for (std::size_t i = 0; i < blocks_.size(); ++i) {
-      blocks_[i].offset = 0;
-      if (i > 0 && !blocks_[i].external) {
-        delete[] blocks_[i].data;
-        blocks_[i].data = nullptr;
-        blocks_[i].size = 0;
+    for (auto& blk : blocks_) {
+      blk.offset = 0;
+      if (!blk.external && blk.data) {
+        delete[] blk.data;
+        blk.data = nullptr;
+        blk.size = 0;
       }
     }
     if (blocks_.size() > 1) blocks_.resize(1);
+  }
+
+  ~ReusableMonotonicResource() override { Release(); }
+
+  std::size_t Used() const {
+    std::size_t total = 0;
+    for (const auto& blk : blocks_) total += blk.offset;
+    return total;
   }
 
  protected:
@@ -70,7 +78,7 @@ class ReusableMonotonicResource : public std::pmr::memory_resource {
   void do_deallocate(void*, std::size_t, std::size_t) override {}
   bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
 
- private:
+  private:
   struct Block {
     std::byte* data{nullptr};
     std::size_t size{0};
@@ -167,7 +175,7 @@ struct MemTable::Shard {
 
   std::size_t ApproximateMemoryUsage() const {
     std::shared_lock lk(mu_);
-    return memory_usage_;
+    return resource_.Used();
   }
 
   bool Empty() const {
@@ -199,6 +207,7 @@ MemTable::MemTable(std::size_t shard_count, std::size_t approx_capacity_bytes)
   for (std::size_t i = 0; i < shard_count_; ++i) {
     shards_.push_back(std::make_unique<Shard>(reserve_buckets));
   }
+  base_usage_ = RawMemoryUsage();
 }
 
 MemTable::~MemTable() = default;
@@ -277,14 +286,13 @@ void MemTable::Clear() {
   for (auto& shard : shards_) {
     shard->Clear();
   }
+  base_usage_ = RawMemoryUsage();
 }
 
 std::size_t MemTable::ApproximateMemoryUsage() const {
-  std::size_t total = 0;
-  for (const auto& shard : shards_) {
-    total += shard->ApproximateMemoryUsage();
-  }
-  return total;
+  const std::size_t raw = RawMemoryUsage();
+  if (raw <= base_usage_) return 0;
+  return raw - base_usage_;
 }
 
 bool MemTable::Empty() const {
@@ -292,6 +300,14 @@ bool MemTable::Empty() const {
     if (!shard->Empty()) return false;
   }
   return true;
+}
+
+std::size_t MemTable::RawMemoryUsage() const {
+  std::size_t total = 0;
+  for (const auto& shard : shards_) {
+    total += shard->ApproximateMemoryUsage();
+  }
+  return total;
 }
 
 }  // namespace dkv

@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -16,12 +17,25 @@ class BlockCache {
  public:
   explicit BlockCache(std::size_t capacity_bytes) : capacity_bytes_(capacity_bytes) {}
 
-  bool Get(const std::string& file, std::uint64_t offset, std::vector<MemEntry>& out);
-  void Put(const std::string& file, std::uint64_t offset, std::vector<MemEntry> entries);
+  bool Get(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
+           std::shared_ptr<const std::vector<MemEntry>>& out);
+  void Put(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
+           std::vector<MemEntry> entries);
+
+  struct Stats {
+    std::uint64_t hits{0};
+    std::uint64_t misses{0};
+    std::uint64_t puts{0};
+    std::uint64_t evictions{0};
+    std::size_t used_bytes{0};
+    std::size_t capacity_bytes{0};
+    std::size_t entries{0};
+  };
+  Stats GetStats() const;
 
  private:
   struct Key {
-    std::string file;
+    const std::string* file{nullptr};
     std::uint64_t offset;
 
     bool operator==(const Key& other) const { return offset == other.offset && file == other.file; }
@@ -29,13 +43,14 @@ class BlockCache {
 
   struct KeyHash {
     std::size_t operator()(const Key& k) const noexcept {
-      return std::hash<std::string>()(k.file) ^ (std::hash<std::uint64_t>()(k.offset) << 1);
+      return std::hash<const void*>()(k.file) ^ (std::hash<std::uint64_t>()(k.offset) << 1);
     }
   };
 
   struct Entry {
     Key key;
-    std::vector<MemEntry> entries;
+    std::shared_ptr<const std::string> file_ref;
+    std::shared_ptr<const std::vector<MemEntry>> entries;
     std::size_t bytes{0};
   };
 
@@ -46,7 +61,12 @@ class BlockCache {
 
   std::list<Entry> lru_;
   std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> map_;
-  std::mutex mu_;
+  mutable std::mutex mu_;
+
+  std::atomic<std::uint64_t> hits_{0};
+  std::atomic<std::uint64_t> misses_{0};
+  std::atomic<std::uint64_t> puts_{0};
+  std::atomic<std::uint64_t> evictions_{0};
 };
 
 }  // namespace dkv

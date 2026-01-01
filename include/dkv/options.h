@@ -27,6 +27,12 @@ struct Options {
   std::size_t level_base_bytes{128 * 1024 * 1024};
   std::size_t level_size_multiplier{10};
   std::size_t max_levels{4};
+  // Number of background flush threads for memtables.
+  std::size_t flush_thread_count{1};
+  // Max immutable memtables queued before blocking writers.
+  std::size_t max_immutable_memtables{8};
+  // Number of background compaction threads.
+  std::size_t compaction_thread_count{1};
   // Periodic WAL sync interval in milliseconds (0 disables background sync).
   std::size_t wal_sync_interval_ms{0};
   // Enable CRC32 for WAL records. Disable for performance experiments only.

@@ -38,6 +38,8 @@ class SSTable {
   [[nodiscard]] const std::string& min_key() const { return min_key_; }
   [[nodiscard]] const std::string& max_key() const { return max_key_; }
   [[nodiscard]] std::uint64_t file_size() const { return file_size_; }
+  [[nodiscard]] std::size_t block_count() const { return blocks_.size(); }
+  Status ReadBlockByIndex(std::size_t index, std::vector<MemEntry>& out) const;
 
  private:
   struct BlockIndexEntry {
@@ -56,9 +58,11 @@ class SSTable {
   bool ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string_view key, MemEntry& entry) const;
   bool ReadBlockRange(std::uint64_t start, std::uint64_t end,
                       std::vector<std::pair<std::string, std::string>>& out, std::size_t limit) const;
-  bool ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<MemEntry>& out) const;
+  bool ReadBlock(std::uint64_t start, std::uint64_t size,
+                 std::shared_ptr<const std::vector<MemEntry>>& out) const;
 
   std::filesystem::path path_;
+  std::shared_ptr<const std::string> path_ref_;
   std::vector<BlockIndexEntry> blocks_;
   std::string min_key_;
   std::string max_key_;

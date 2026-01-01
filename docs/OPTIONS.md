@@ -6,7 +6,10 @@ DKV exposes tuning knobs through `dkv::Options` (compile-time compression backen
 - `memtable_shard_count` – More shards reduce write lock contention; too many shards increase flush sort/merge cost.
 - `sync_wal` / `WriteOptions::sync` – `true` fsyncs every write (strong durability, higher latency). `false` relies on OS buffering; combine with `wal_sync_interval_ms` for periodic sync.
 - `wal_sync_interval_ms` – Background WAL fsync cadence. Non-zero lowers per-op latency but risks bounded data loss up to the interval.
+- `flush_thread_count` – Number of background threads flushing immutable memtables to L0 SSTables. Larger can increase throughput if flush is CPU-bound; too large can contend on disk.
+- `max_immutable_memtables` – Queue depth of immutables before writers block. Increase to let background flush absorb bursts; decrease to bound memory/stall sooner.
 - `enable_crc` – Disable only for perf experiments; CRC protects WAL replay.
+- `compaction_thread_count` – Number of background compaction threads. More threads can reduce L0 pile-up/read amp at the cost of extra write amp and IO contention.
 - `sstable_target_size_bytes` – Larger files reduce index/Bloom overhead and compaction fan-out; too large raises compaction pause and write amplification when rewriting big runs.
 - `sstable_block_size_bytes` – Larger blocks reduce index size and Bloom checks; smaller blocks improve point-lookups and reduce read amplification for sparse reads.
 - `bloom_bits_per_key` – Higher reduces false positives (fewer block reads) at extra space cost; low values can amplify read IO.

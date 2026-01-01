@@ -261,6 +261,7 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
                  std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
                  std::shared_ptr<BlockCache> cache, std::shared_ptr<BloomCache> bloom_cache)
     : path_(std::move(path)),
+      path_ref_(std::make_shared<std::string>(path_.string())),
       blocks_(std::move(index)),
       min_key_(std::move(min_key)),
       max_key_(std::move(max_key)),
@@ -318,11 +319,11 @@ std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
     }
   }
 
-  if (pin_bloom_) {
+  // Keep a strong ref so we don't reload from disk every Get when no shared cache is configured.
+  if (pin_bloom_ || !bloom_cache_) {
     pinned_bloom_ = data;
-  } else {
-    bloom_ref_ = data;
   }
+  bloom_ref_ = data;
   return data;
 }
 
@@ -442,12 +443,23 @@ bool SSTable::Get(std::string_view key, MemEntry& entry) const {
 
 Status SSTable::LoadAll(std::vector<MemEntry>& out) const {
   for (const auto& b : blocks_) {
-    std::vector<MemEntry> block;
+    std::shared_ptr<const std::vector<MemEntry>> block;
     if (!ReadBlock(b.offset, b.size, block)) {
       return Status::Corruption("failed to read block: " + path_.string());
     }
-    out.insert(out.end(), std::make_move_iterator(block.begin()), std::make_move_iterator(block.end()));
+    out.insert(out.end(), block->begin(), block->end());
   }
+  return Status::OK();
+}
+
+Status SSTable::ReadBlockByIndex(std::size_t index, std::vector<MemEntry>& out) const {
+  if (index >= blocks_.size()) return Status::InvalidArgument("block index out of range");
+  out.clear();
+  std::shared_ptr<const std::vector<MemEntry>> block;
+  if (!ReadBlock(blocks_[index].offset, blocks_[index].size, block)) {
+    return Status::Corruption("failed to read block: " + path_.string());
+  }
+  out.assign(block->begin(), block->end());
   return Status::OK();
 }
 
@@ -472,47 +484,59 @@ Status SSTable::Scan(std::string_view from, std::size_t limit,
 
 bool SSTable::ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string_view key,
                              MemEntry& entry) const {
+  auto find_in_block = [&](const std::vector<MemEntry>& block) -> const MemEntry* {
+    auto it = std::lower_bound(
+        block.begin(), block.end(), key, [](const MemEntry& e, std::string_view k) { return e.key < k; });
+    if (it != block.end() && it->key == key) return &*it;
+    return nullptr;
+  };
+
   if (cache_) {
-    std::vector<MemEntry> cached;
-    if (cache_->Get(path_.string(), start, cached)) {
-      auto it = std::find_if(cached.begin(), cached.end(), [&](const MemEntry& e) { return e.key == key; });
-      if (it != cached.end()) {
-        entry = *it;
+    std::shared_ptr<const std::vector<MemEntry>> cached;
+    if (cache_->Get(path_ref_, start, cached)) {
+      if (const MemEntry* hit = find_in_block(*cached)) {
+        entry = *hit;
         return true;
       }
     }
   }
-  std::vector<MemEntry> block;
+  std::shared_ptr<const std::vector<MemEntry>> block;
   if (!ReadBlock(start, end - start, block)) return false;
-  if (cache_) cache_->Put(path_.string(), start, block);
-  auto it = std::find_if(block.begin(), block.end(), [&](const MemEntry& e) { return e.key == key; });
-  if (it == block.end()) return false;
-  entry = *it;
-  return true;
+  if (const MemEntry* hit = find_in_block(*block)) {
+    entry = *hit;
+    return true;
+  }
+  return false;
 }
 
 bool SSTable::ReadBlockRange(std::uint64_t start, std::uint64_t end,
                              std::vector<std::pair<std::string, std::string>>& out,
                              std::size_t limit) const {
   if (cache_) {
-    std::vector<MemEntry> cached;
-    if (cache_->Get(path_.string(), start, cached)) {
-      for (const auto& e : cached) {
+    std::shared_ptr<const std::vector<MemEntry>> cached;
+    if (cache_->Get(path_ref_, start, cached)) {
+      for (const auto& e : *cached) {
         if (!e.deleted && out.size() < limit) out.emplace_back(e.key, e.value);
       }
       return true;
     }
   }
-  std::vector<MemEntry> block;
+  std::shared_ptr<const std::vector<MemEntry>> block;
   if (!ReadBlock(start, end - start, block)) return false;
-  if (cache_) cache_->Put(path_.string(), start, block);
-  for (const auto& e : block) {
+  for (const auto& e : *block) {
     if (!e.deleted && out.size() < limit) out.emplace_back(e.key, e.value);
   }
   return true;
 }
 
-bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<MemEntry>& out) const {
+bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
+                        std::shared_ptr<const std::vector<MemEntry>>& out) const {
+  if (cache_) {
+    if (cache_->Get(path_ref_, start, out)) {
+      return true;
+    }
+  }
+
   std::lock_guard lock(io_mu_);
   if (!file_.is_open()) return false;
   file_.clear();
@@ -536,6 +560,8 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<Mem
   }
   if (data_view.size() != hdr.raw_size) return false;
 
+  auto vec = std::make_shared<std::vector<MemEntry>>();
+  vec->reserve(data_view.size() / 16 + 1);
   std::size_t offset = 0;
   while (offset < data_view.size()) {
     if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
@@ -564,8 +590,10 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size, std::vector<Mem
     e.value = std::move(value);
     e.seq = seq;
     e.deleted = type != 0;
-    out.push_back(std::move(e));
+    vec->push_back(std::move(e));
   }
+  if (cache_) cache_->Put(path_ref_, start, *vec);
+  out = std::move(vec);
   return true;
 }
 
