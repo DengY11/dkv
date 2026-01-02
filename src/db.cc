@@ -72,6 +72,9 @@ class DB::Impl {
   Status LoadSSTables();
   Status LoadManifest(std::vector<std::vector<TableRef>>& loaded);
   Status WriteManifest();
+  void InitNextFileId();
+  std::uint64_t NextFileId();
+  static std::uint64_t ExtractFileId(const std::filesystem::path& path);
   Status CompactLevel(std::size_t level);
   std::uint64_t LevelMaxBytes(std::size_t level) const;
   std::uint64_t LevelBytes(std::size_t level) const;
@@ -117,6 +120,7 @@ class DB::Impl {
   std::shared_ptr<BloomCache> bloom_cache_;
   std::mutex manifest_mu_;
   std::atomic<std::uint64_t> manifest_tmp_seq_{0};
+  std::atomic<std::uint64_t> next_file_id_{1};
   struct FlushResult {
     std::vector<TableRef> tables;
     std::filesystem::path wal_path;
@@ -286,15 +290,18 @@ void DB::Impl::WalSyncLoop() {
 
 Status DB::Impl::LoadSSTables() {
   std::vector<std::vector<TableRef>> loaded;
+  bool manifest_loaded = false;
   // Try manifest first.
   if (std::filesystem::exists(data_dir_ / "MANIFEST")) {
     Status ms = LoadManifest(loaded);
     if (!ms.ok()) return ms;
+    manifest_loaded = !loaded.empty();
   }
   if (!loaded.empty()) {
     std::unique_lock lock(sstable_mu_);
     levels_ = std::move(loaded);
     next_compact_index_.assign(levels_.size(), 0);
+    InitNextFileId();
     return Status::OK();
   }
 
@@ -344,6 +351,8 @@ Status DB::Impl::LoadSSTables() {
 
   std::unique_lock lock(sstable_mu_);
   levels_ = std::move(loaded);
+  InitNextFileId();
+  if (manifest_loaded) return Status::OK();
   return WriteManifest();
 }
 
@@ -646,7 +655,7 @@ Status DB::Impl::WriteManifest() {
   {
     std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return Status::IOError("open MANIFEST.tmp failed");
-    out << "MANIFEST 1\n";
+    out << "MANIFEST 2 " << next_file_id_.load(std::memory_order_relaxed) << "\n";
     for (const auto& e : entries) {
       out << std::get<0>(e) << "|" << std::get<1>(e) << "|" << std::get<2>(e) << "|" << std::get<3>(e) << "|"
           << std::get<4>(e) << "|" << std::get<5>(e) << "\n";
@@ -672,7 +681,33 @@ Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
   if (!in.is_open()) return Status::IOError("failed to open MANIFEST");
   std::string header;
   if (!std::getline(in, header)) return Status::Corruption("empty MANIFEST");
-  if (header != "MANIFEST 1") return Status::Corruption("unsupported MANIFEST version");
+  std::uint64_t manifest_next_file_id = 1;
+  {
+    std::stringstream hs(header);
+    std::string magic;
+    std::string version_str;
+    hs >> magic >> version_str;
+    if (magic != "MANIFEST" || version_str.empty()) return Status::Corruption("unsupported MANIFEST version");
+    int version = 0;
+    try {
+      version = std::stoi(version_str);
+    } catch (...) {
+      return Status::Corruption("unsupported MANIFEST version");
+    }
+    if (version == 1) {
+      // legacy header without next_file_id_
+    } else if (version == 2) {
+      std::string next_id_str;
+      if (!(hs >> next_id_str)) return Status::Corruption("unsupported MANIFEST version");
+      try {
+        manifest_next_file_id = static_cast<std::uint64_t>(std::stoull(next_id_str));
+      } catch (...) {
+        return Status::Corruption("unsupported MANIFEST version");
+      }
+    } else {
+      return Status::Corruption("unsupported MANIFEST version");
+    }
+  }
 
   auto ensure_level = [&loaded](std::size_t level) {
     if (loaded.size() <= level) loaded.resize(level + 1);
@@ -706,6 +741,8 @@ Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
     ensure_level(level);
     loaded[level].push_back(TableRef{table, min_key, max_key, size == 0 ? table->file_size() : size});
   }
+  next_file_id_.store(std::max(next_file_id_.load(std::memory_order_relaxed), manifest_next_file_id),
+                      std::memory_order_relaxed);
   return Status::OK();
 }
 
@@ -726,6 +763,46 @@ std::uint64_t DB::Impl::LevelBytes(std::size_t level) const {
     total += t.size;
   }
   return total;
+}
+
+std::uint64_t DB::Impl::ExtractFileId(const std::filesystem::path& path) {
+  const auto name = path.filename().string();
+  if (name.rfind("sst-l", 0) != 0) return 0;
+  auto dash = name.find('-', 5);
+  if (dash == std::string::npos) return 0;
+  auto rest = name.substr(dash + 1);
+  auto dot = rest.rfind('.');
+  if (dot != std::string::npos) rest = rest.substr(0, dot);
+  std::uint64_t max_token = 0;
+  std::size_t pos = 0;
+  while (pos < rest.size()) {
+    auto next = rest.find('-', pos);
+    const auto token = rest.substr(pos, next == std::string::npos ? rest.size() - pos : next - pos);
+    try {
+      max_token = std::max(max_token, static_cast<std::uint64_t>(std::stoull(token)));
+    } catch (...) {
+    }
+    if (next == std::string::npos) break;
+    pos = next + 1;
+  }
+  return max_token;
+}
+
+void DB::Impl::InitNextFileId() {
+  std::uint64_t max_id = 0;
+  if (std::filesystem::exists(sst_dir_)) {
+    for (const auto& entry : std::filesystem::directory_iterator(sst_dir_)) {
+      if (!entry.is_regular_file() || entry.path().extension() != ".sst") continue;
+      max_id = std::max(max_id, ExtractFileId(entry.path()));
+    }
+  }
+  std::uint64_t current = next_file_id_.load(std::memory_order_relaxed);
+  if (current == 0) current = 1;
+  next_file_id_.store(std::max(current, max_id + 1), std::memory_order_relaxed);
+}
+
+std::uint64_t DB::Impl::NextFileId() {
+  return next_file_id_.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool DB::Impl::PickCompactionLevel(std::size_t& target_level) {
@@ -821,9 +898,7 @@ Status DB::Impl::FlushImmutable(const std::shared_ptr<ImmutableMem>& imm) {
   std::uint64_t chunk_approx = 0;
   auto flush_chunk = [&](std::vector<MemEntryView>& data) -> Status {
     if (data.empty()) return Status::OK();
-    std::uint64_t chunk_max_seq = 0;
-    for (const auto& e : data) chunk_max_seq = std::max(chunk_max_seq, e.seq);
-    const auto filename = "sst-l0-" + std::to_string(chunk_max_seq) + "-" + std::to_string(new_tables.size()) + ".sst";
+    const auto filename = "sst-l0-" + std::to_string(NextFileId()) + ".sst";
     const auto path = sst_dir_ / filename;
 
     Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes, options_.bloom_bits_per_key,
@@ -1098,11 +1173,7 @@ Status DB::Impl::CompactLevel(std::size_t level) {
   std::uint64_t approx_size = 0;
   auto flush_chunk = [&](std::vector<MemEntry>& data) -> Status {
     if (data.empty()) return Status::OK();
-    std::uint64_t max_seq = 0;
-    for (const auto& e : data) max_seq = std::max(max_seq, e.seq);
-    const auto filename =
-        "sst-l" + std::to_string(level + 1) + "-" + std::to_string(max_seq) + "-" +
-        std::to_string(outputs.size()) + ".sst";
+    const auto filename = "sst-l" + std::to_string(level + 1) + "-" + std::to_string(NextFileId()) + ".sst";
     const auto path = sst_dir_ / filename;
     Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes,
                                options_.bloom_bits_per_key, options_.enable_compress);
