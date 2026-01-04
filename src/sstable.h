@@ -59,7 +59,7 @@ class SSTable {
   bool ReadBlockRange(std::uint64_t start, std::uint64_t end,
                       std::vector<std::pair<std::string, std::string>>& out, std::size_t limit) const;
   bool ReadBlock(std::uint64_t start, std::uint64_t size,
-                 std::shared_ptr<const std::string>& out) const;
+                 std::shared_ptr<const std::vector<MemEntry>>& out) const;
 
   std::filesystem::path path_;
   std::shared_ptr<const std::string> path_ref_;

@@ -9,6 +9,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "memtable.h"
+
 namespace dkv {
 
 class BlockCache {
@@ -16,9 +18,9 @@ class BlockCache {
   explicit BlockCache(std::size_t capacity_bytes) : capacity_bytes_(capacity_bytes) {}
 
   bool Get(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
-           std::shared_ptr<const std::string>& out);
+           std::shared_ptr<const std::vector<MemEntry>>& out);
   void Put(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
-           std::string data);
+           std::vector<MemEntry> entries);
 
   struct Stats {
     std::uint64_t hits{0};
@@ -48,7 +50,7 @@ class BlockCache {
   struct Entry {
     Key key;
     std::shared_ptr<const std::string> file_ref;
-    std::shared_ptr<const std::string> data;
+    std::shared_ptr<const std::vector<MemEntry>> data;
     std::size_t bytes{0};
   };
 

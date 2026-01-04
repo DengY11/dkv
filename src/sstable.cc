@@ -35,67 +35,6 @@ struct BlockHeader {
 
 static bool DecompressData(std::uint8_t code, std::string_view input, std::string& output, std::size_t raw_size);
 
-bool DecodeBlock(const std::shared_ptr<const std::string>& raw_block, std::vector<MemEntry>& out) {
-  const char* buf = raw_block->data();
-  const std::size_t buf_size = raw_block->size();
-  if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t)) return false;
-
-  std::uint32_t raw_size = 0;
-  std::uint32_t stored_size = 0;
-  std::uint8_t compression = 0;
-  std::memcpy(&raw_size, buf, sizeof(raw_size));
-  std::memcpy(&stored_size, buf + sizeof(raw_size), sizeof(stored_size));
-  std::memcpy(&compression, buf + sizeof(raw_size) + sizeof(stored_size), sizeof(compression));
-  const std::size_t header_bytes = sizeof(raw_size) + sizeof(stored_size) + sizeof(compression);
-  if (header_bytes + stored_size > buf_size) return false;
-
-  std::string raw;
-  std::string_view data_view;
-  if (compression != 0) {
-    if (!DecompressData(compression, raw_block->substr(header_bytes, stored_size), raw, raw_size)) return false;
-    data_view = raw;
-  } else {
-    data_view = std::string_view(raw_block->data() + header_bytes, raw_size);
-  }
-  if (data_view.size() != raw_size) return false;
-
-  out.clear();
-  out.reserve(data_view.size() / 16 + 1);
-  std::size_t offset = 0;
-  while (offset < data_view.size()) {
-    if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
-    const std::uint8_t type = static_cast<std::uint8_t>(data_view[offset]);
-    offset += 1;
-    std::uint64_t seq = 0;
-    for (int i = 0; i < 8; ++i) {
-      seq |= static_cast<std::uint64_t>(static_cast<unsigned char>(data_view[offset + i])) << (8 * i);
-    }
-    offset += 8;
-    const auto read32 = [&](std::size_t pos) -> std::uint32_t {
-      return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
-    };
-    const std::uint32_t key_size = read32(offset);
-    offset += 4;
-    const std::uint32_t value_size = read32(offset);
-    offset += 4;
-    if (offset + key_size + value_size > data_view.size()) break;
-    std::string key(data_view.substr(offset, key_size));
-    offset += key_size;
-    std::string value(data_view.substr(offset, value_size));
-    offset += value_size;
-    MemEntry e;
-    e.key = std::move(key);
-    e.value = std::move(value);
-    e.seq = seq;
-    e.deleted = type != 0;
-    out.push_back(std::move(e));
-  }
-  return true;
-}
-
 inline void AppendU8(std::string& buf, std::uint8_t v) { buf.push_back(static_cast<char>(v)); }
 inline void AppendU32(std::string& buf, std::uint32_t v) {
   buf.push_back(static_cast<char>(v & 0xFFu));
@@ -507,13 +446,11 @@ bool SSTable::Get(std::string_view key, MemEntry& entry) const {
 
 Status SSTable::LoadAll(std::vector<MemEntry>& out) const {
   for (const auto& b : blocks_) {
-    std::shared_ptr<const std::string> raw_block;
+    std::shared_ptr<const std::vector<MemEntry>> raw_block;
     if (!ReadBlock(b.offset, b.size, raw_block)) {
       return Status::Corruption("failed to read block: " + path_.string());
     }
-    std::vector<MemEntry> decoded;
-    if (!DecodeBlock(raw_block, decoded)) return Status::Corruption("failed to decode block: " + path_.string());
-    out.insert(out.end(), decoded.begin(), decoded.end());
+    out.insert(out.end(), raw_block->begin(), raw_block->end());
   }
   return Status::OK();
 }
@@ -521,11 +458,11 @@ Status SSTable::LoadAll(std::vector<MemEntry>& out) const {
 Status SSTable::ReadBlockByIndex(std::size_t index, std::vector<MemEntry>& out) const {
   if (index >= blocks_.size()) return Status::InvalidArgument("block index out of range");
   out.clear();
-  std::shared_ptr<const std::string> raw_block;
+  std::shared_ptr<const std::vector<MemEntry>> raw_block;
   if (!ReadBlock(blocks_[index].offset, blocks_[index].size, raw_block)) {
     return Status::Corruption("failed to read block: " + path_.string());
   }
-  if (!DecodeBlock(raw_block, out)) return Status::Corruption("failed to decode block: " + path_.string());
+  out.assign(raw_block->begin(), raw_block->end());
   return Status::OK();
 }
 
@@ -550,127 +487,30 @@ Status SSTable::Scan(std::string_view from, std::size_t limit,
 
 bool SSTable::ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string_view key,
                              MemEntry& entry) const {
-  std::shared_ptr<const std::string> raw_block;
-  if (!ReadBlock(start, end - start, raw_block)) return false;
-
-  auto find_in_block = [&](std::string_view data_view) -> bool {
-    std::size_t offset = 0;
-    while (offset < data_view.size()) {
-      if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
-      const std::uint8_t type = static_cast<std::uint8_t>(data_view[offset]);
-      offset += 1;
-      std::uint64_t seq = 0;
-      for (int i = 0; i < 8; ++i) seq |=
-          static_cast<std::uint64_t>(static_cast<unsigned char>(data_view[offset + i])) << (8 * i);
-      offset += 8;
-      const auto read32 = [&](std::size_t pos) -> std::uint32_t {
-        return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
-               (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
-               (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
-               (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
-      };
-      const std::uint32_t key_size = read32(offset);
-      offset += 4;
-      const std::uint32_t value_size = read32(offset);
-      offset += 4;
-      if (offset + key_size + value_size > data_view.size()) break;
-      std::string_view k(&data_view[offset], key_size);
-      offset += key_size;
-      if (k == key) {
-        entry.key.assign(k);
-        entry.value.assign(&data_view[offset], value_size);
-        entry.seq = seq;
-        entry.deleted = type != 0;
-        return true;
-      }
-      offset += value_size;
+  std::shared_ptr<const std::vector<MemEntry>> block;
+  if (!ReadBlock(start, end - start, block)) return false;
+  for (const auto& e : *block) {
+    if (e.key == key) {
+      entry = e;
+      return true;
     }
-    return false;
-  };
-
-  // raw_block layout: [raw_size][stored_size][compression][payload...]
-  const char* buf = raw_block->data();
-  const std::size_t buf_size = raw_block->size();
-  if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t)) return false;
-  std::uint32_t raw_size = 0;
-  std::uint32_t stored_size = 0;
-  std::uint8_t compression = 0;
-  std::memcpy(&raw_size, buf, sizeof(raw_size));
-  std::memcpy(&stored_size, buf + sizeof(raw_size), sizeof(stored_size));
-  std::memcpy(&compression, buf + sizeof(raw_size) + sizeof(stored_size), sizeof(compression));
-  const std::size_t header_bytes = sizeof(raw_size) + sizeof(stored_size) + sizeof(compression);
-  if (header_bytes + stored_size > buf_size) return false;
-
-  std::string raw;
-  std::string_view data_view;
-  if (compression != 0) {
-    if (!DecompressData(compression, raw_block->substr(header_bytes, stored_size), raw, raw_size)) return false;
-    data_view = raw;
-  } else {
-    data_view = std::string_view(raw_block->data() + header_bytes, raw_size);
   }
-  if (data_view.size() != raw_size) return false;
-
-  if (find_in_block(data_view)) return true;
   return false;
 }
 
 bool SSTable::ReadBlockRange(std::uint64_t start, std::uint64_t end,
                              std::vector<std::pair<std::string, std::string>>& out,
                              std::size_t limit) const {
-  std::shared_ptr<const std::string> raw_block;
-  if (!ReadBlock(start, end - start, raw_block)) return false;
-  const char* buf = raw_block->data();
-  const std::size_t buf_size = raw_block->size();
-  if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t)) return false;
-  std::uint32_t raw_size = 0;
-  std::uint32_t stored_size = 0;
-  std::uint8_t compression = 0;
-  std::memcpy(&raw_size, buf, sizeof(raw_size));
-  std::memcpy(&stored_size, buf + sizeof(raw_size), sizeof(stored_size));
-  std::memcpy(&compression, buf + sizeof(raw_size) + sizeof(stored_size), sizeof(compression));
-  const std::size_t header_bytes = sizeof(raw_size) + sizeof(stored_size) + sizeof(compression);
-  if (header_bytes + stored_size > buf_size) return false;
-
-  std::string raw;
-  std::string_view data_view;
-  if (compression != 0) {
-    if (!DecompressData(compression, raw_block->substr(header_bytes, stored_size), raw, raw_size)) return false;
-    data_view = raw;
-  } else {
-    data_view = std::string_view(raw_block->data() + header_bytes, raw_size);
-  }
-  if (data_view.size() != raw_size) return false;
-  std::size_t offset = 0;
-  while (offset < data_view.size() && out.size() < limit) {
-    if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
-    const std::uint8_t type = static_cast<std::uint8_t>(data_view[offset]);
-    offset += 1;
-    offset += 8;  // seq, unused for scan
-    const auto read32 = [&](std::size_t pos) -> std::uint32_t {
-      return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
-    };
-    const std::uint32_t key_size = read32(offset);
-    offset += 4;
-    const std::uint32_t value_size = read32(offset);
-    offset += 4;
-    if (offset + key_size + value_size > data_view.size()) break;
-    std::string key(data_view.substr(offset, key_size));
-    offset += key_size;
-    std::string value(data_view.substr(offset, value_size));
-    offset += value_size;
-    if (!type) {
-      out.emplace_back(std::move(key), std::move(value));
-    }
+  std::shared_ptr<const std::vector<MemEntry>> block;
+  if (!ReadBlock(start, end - start, block)) return false;
+  for (const auto& e : *block) {
+    if (!e.deleted && out.size() < limit) out.emplace_back(e.key, e.value);
   }
   return true;
 }
 
 bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
-                        std::shared_ptr<const std::string>& out) const {
+                        std::shared_ptr<const std::vector<MemEntry>>& out) const {
   if (cache_) {
     if (cache_->Get(path_ref_, start, out)) {
       return true;
@@ -688,18 +528,53 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
   const std::uint64_t header_bytes = sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression);
   if (header_bytes + hdr.stored_size > size) return false;
 
-  std::string payload;
-  payload.resize(static_cast<std::size_t>(header_bytes + hdr.stored_size));
-  // Serialize header + payload into one contiguous buffer for caching.
-  std::memcpy(payload.data(), &hdr.raw_size, sizeof(hdr.raw_size));
-  std::memcpy(payload.data() + sizeof(hdr.raw_size), &hdr.stored_size, sizeof(hdr.stored_size));
-  std::memcpy(payload.data() + sizeof(hdr.raw_size) + sizeof(hdr.stored_size), &hdr.compression,
-              sizeof(hdr.compression));
-  if (!file_.read(payload.data() + header_bytes, static_cast<std::streamsize>(hdr.stored_size))) return false;
+  std::string payload(hdr.stored_size, '\0');
+  if (!file_.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) return false;
 
-  auto sp = std::make_shared<std::string>(std::move(payload));
-  if (cache_) cache_->Put(path_ref_, start, *sp);
-  out = std::move(sp);
+  std::string raw;
+  std::string_view data_view;
+  if (hdr.compression != 0) {
+    if (!DecompressData(hdr.compression, payload, raw, hdr.raw_size)) return false;
+    data_view = raw;
+  } else {
+    data_view = payload;
+  }
+  if (data_view.size() != hdr.raw_size) return false;
+
+  auto vec = std::make_shared<std::vector<MemEntry>>();
+  vec->reserve(data_view.size() / 16 + 1);
+  std::size_t offset = 0;
+  while (offset < data_view.size()) {
+    if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
+    const std::uint8_t type = static_cast<std::uint8_t>(data_view[offset]);
+    offset += 1;
+    std::uint64_t seq = 0;
+    for (int i = 0; i < 8; ++i) seq |= static_cast<std::uint64_t>(static_cast<unsigned char>(data_view[offset + i])) << (8 * i);
+    offset += 8;
+    auto read32 = [&](std::size_t pos) -> std::uint32_t {
+      return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
+             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
+    };
+    const std::uint32_t key_size = read32(offset);
+    offset += 4;
+    const std::uint32_t value_size = read32(offset);
+    offset += 4;
+    if (offset + key_size + value_size > data_view.size()) break;
+    std::string key(data_view.substr(offset, key_size));
+    offset += key_size;
+    std::string value(data_view.substr(offset, value_size));
+    offset += value_size;
+    MemEntry e;
+    e.key = std::move(key);
+    e.value = std::move(value);
+    e.seq = seq;
+    e.deleted = type != 0;
+    vec->push_back(std::move(e));
+  }
+  if (cache_) cache_->Put(path_ref_, start, *vec);
+  out = std::move(vec);
   return true;
 }
 

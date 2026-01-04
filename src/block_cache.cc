@@ -5,7 +5,7 @@
 namespace dkv {
 
 bool BlockCache::Get(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
-                     std::shared_ptr<const std::string>& out) {
+                     std::shared_ptr<const std::vector<MemEntry>>& out) {
   std::lock_guard lock(mu_);
   Key key{file.get(), offset};
   auto it = map_.find(key);
@@ -20,13 +20,17 @@ bool BlockCache::Get(const std::shared_ptr<const std::string>& file, std::uint64
 }
 
 void BlockCache::Put(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
-                     std::string data) {
-  const std::size_t bytes = data.size();
+                     std::vector<MemEntry> entries) {
+  // use capacity instead size().
+  std::size_t bytes = entries.capacity() * sizeof(MemEntry);
+  for (const auto& e : entries) {
+    bytes += e.key.capacity() + e.value.capacity();
+  }
   if (bytes > capacity_bytes_) return;  // too big to cache
 
   std::lock_guard lock(mu_);
   Key key{file.get(), offset};
-  auto sp = std::make_shared<std::string>(std::move(data));
+  auto sp = std::make_shared<std::vector<MemEntry>>(std::move(entries));
   auto existing = map_.find(key);
   if (existing != map_.end()) {
     used_bytes_ -= existing->second->bytes;
