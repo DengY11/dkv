@@ -120,7 +120,7 @@ CrudStats BenchDKVSingle(const Args& args, Mode mode) {
   opts.max_immutable_memtables = 4;
   opts.flush_thread_count = 4;
   opts.compaction_thread_count = 3;
-  opts.block_cache_capacity_bytes = 1024 * 1024 * 1024;
+  opts.block_cache_capacity_bytes = 5ull * 1024 * 1024 * 1024;  // force 64-bit to avoid overflow
   opts.wal_sync_interval_ms = sync ? 0 : 5;
   opts.bloom_cache_capacity_bytes = 512 * 1024 * 1024;
   std::unique_ptr<dkv::DB> db;
