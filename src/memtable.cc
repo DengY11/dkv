@@ -1,6 +1,8 @@
 #include "memtable.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <climits>
 #include <functional>
 #include <mutex>
 #include <memory>
@@ -12,7 +14,21 @@
 namespace dkv {
 
 namespace {
-inline std::size_t KeyHash(std::string_view key) { return std::hash<std::string_view>{}(key); }
+static inline std::hash<std::string_view> global_hash{};
+inline std::size_t KeyHash(std::string_view key) { return global_hash(key); }
+inline std::size_t NextPow2(std::size_t v) {
+  if (v <= 1) return 1;
+  --v;
+  v |= v >> 1;
+  v |= v >> 2;
+  v |= v >> 4;
+  v |= v >> 8;
+  v |= v >> 16;
+#if ULONG_MAX > 0xFFFFFFFF
+  v |= v >> 32;
+#endif
+  return v + 1;
+}
 
 struct TransparentHash {
   using is_transparent = void;
@@ -191,8 +207,11 @@ struct MemTable::Shard {
   std::size_t memory_usage_{0};
 };
 
-MemTable::MemTable(std::size_t shard_count, std::size_t approx_capacity_bytes)
-    : shard_count_(shard_count == 0 ? 1 : shard_count) {
+MemTable::MemTable(std::size_t shard_count, std::size_t approx_capacity_bytes) {
+  shard_count_ = shard_count == 0 ? 1 : shard_count;
+  // Use power-of-two shard count to replace modulo with mask.
+  shard_count_ = NextPow2(shard_count_);
+  shard_mask_ = shard_count_ - 1;
   shards_.reserve(shard_count_);
   constexpr std::size_t kMinBucketsPerShard = 1 << 15;
   constexpr std::size_t kApproxEntryBytes = 64;  // rough key+value size for bucket sizing
@@ -213,17 +232,20 @@ MemTable::MemTable(std::size_t shard_count, std::size_t approx_capacity_bytes)
 MemTable::~MemTable() = default;
 
 Status MemTable::Put(std::uint64_t seq, std::string_view key, std::string_view value) {
-  auto shard = shards_[KeyHash(key) % shard_count_].get();
+  const auto h = KeyHash(key);
+  auto shard = shards_[h & shard_mask_].get();
   return shard->Put(seq, key, value);
 }
 
 Status MemTable::Delete(std::uint64_t seq, std::string_view key) {
-  auto shard = shards_[KeyHash(key) % shard_count_].get();
+  const auto h = KeyHash(key);
+  auto shard = shards_[h & shard_mask_].get();
   return shard->Delete(seq, key);
 }
 
 bool MemTable::Get(std::string_view key, MemEntry& entry) const {
-  auto shard = shards_[KeyHash(key) % shard_count_].get();
+  const auto h = KeyHash(key);
+  auto shard = shards_[h & shard_mask_].get();
   return shard->Get(key, entry);
 }
 
