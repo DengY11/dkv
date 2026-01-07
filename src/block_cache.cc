@@ -73,3 +73,50 @@ BlockCache::Stats BlockCache::GetStats() const {
 }
 
 }  // namespace dkv
+
+namespace dkv {
+
+bool RawBlockCache::Get(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
+                        std::shared_ptr<const std::string>& out) {
+  std::lock_guard lock(mu_);
+  Key key{file.get(), offset};
+  auto it = map_.find(key);
+  if (it == map_.end()) return false;
+  lru_.splice(lru_.begin(), lru_, it->second);
+  out = it->second->data;
+  return true;
+}
+
+void RawBlockCache::Put(const std::shared_ptr<const std::string>& file, std::uint64_t offset, std::string data) {
+  const std::size_t bytes = data.size();
+  if (bytes > capacity_bytes_) return;
+  std::lock_guard lock(mu_);
+  Key key{file.get(), offset};
+  auto sp = std::make_shared<std::string>(std::move(data));
+  auto it = map_.find(key);
+  if (it != map_.end()) {
+    used_bytes_ -= it->second->bytes;
+    it->second->data = sp;
+    it->second->bytes = bytes;
+    it->second->file_ref = file;
+    used_bytes_ += bytes;
+    lru_.splice(lru_.begin(), lru_, it->second);
+  } else {
+    lru_.push_front(Entry{key, file, std::move(sp), bytes});
+    map_[key] = lru_.begin();
+    used_bytes_ += bytes;
+  }
+  EvictIfNeeded();
+}
+
+void RawBlockCache::EvictIfNeeded() {
+  while (used_bytes_ > capacity_bytes_ && !lru_.empty()) {
+    auto last = lru_.end();
+    --last;
+    used_bytes_ -= last->bytes;
+    map_.erase(last->key);
+    lru_.pop_back();
+  }
+}
+
+}  // namespace dkv

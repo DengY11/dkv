@@ -25,8 +25,8 @@ class SSTable {
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
                      std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
-                    const std::shared_ptr<BloomCache>& bloom_cache, bool pin_bloom,
-                    std::shared_ptr<SSTable>& out);
+                    const std::shared_ptr<RawBlockCache>& raw_cache, const std::shared_ptr<BloomCache>& bloom_cache,
+                    bool pin_bloom, std::shared_ptr<SSTable>& out);
 
   bool Get(std::string_view key, MemEntry& entry) const;
   Status LoadAll(std::vector<MemEntry>& out) const;
@@ -51,7 +51,8 @@ class SSTable {
   SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, std::string min_key,
           std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
           std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
-          std::shared_ptr<BlockCache> cache, std::shared_ptr<BloomCache> bloom_cache);
+          std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
+          std::shared_ptr<BloomCache> bloom_cache);
 
   std::shared_ptr<BloomCache::Data> LoadBloom() const;
 
@@ -70,6 +71,7 @@ class SSTable {
   std::uint64_t file_size_;
   std::uint64_t bloom_start_;
   std::shared_ptr<BlockCache> cache_;
+  std::shared_ptr<RawBlockCache> raw_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
   std::uint32_t bloom_bytes_{0};
   std::uint32_t bloom_bits_per_key_{0};

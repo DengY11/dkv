@@ -262,7 +262,8 @@ bool ReadFooter(std::ifstream& in, std::uint64_t file_size, ParsedFooter& footer
 SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index, std::string min_key,
                  std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
                  std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
-                 std::shared_ptr<BlockCache> cache, std::shared_ptr<BloomCache> bloom_cache)
+                 std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
+                 std::shared_ptr<BloomCache> bloom_cache)
     : path_(std::move(path)),
       path_ref_(std::make_shared<std::string>(path_.string())),
       blocks_(std::move(index)),
@@ -272,6 +273,7 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
       file_size_(file_size),
       bloom_start_(bloom_start),
       cache_(std::move(cache)),
+      raw_cache_(std::move(raw_cache)),
       bloom_cache_(std::move(bloom_cache)),
       bloom_bytes_(bloom_bytes),
       bloom_bits_per_key_(bloom_bits_per_key),
@@ -331,8 +333,8 @@ std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
 }
 
 Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
-                    const std::shared_ptr<BloomCache>& bloom_cache, bool pin_bloom,
-                    std::shared_ptr<SSTable>& out) {
+                    const std::shared_ptr<RawBlockCache>& raw_cache, const std::shared_ptr<BloomCache>& bloom_cache,
+                    bool pin_bloom, std::shared_ptr<SSTable>& out) {
   auto size_opt = FileSize(path);
   if (!size_opt) return Status::IOError("unable to stat sstable: " + path.string());
 
@@ -423,7 +425,7 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
 
   auto sstable = std::shared_ptr<SSTable>(
       new SSTable(path, std::move(index), index.front().key, max_key, footer.max_seq, *size_opt, footer.bloom_start,
-                  bloom_bytes, bloom_bits, pin_bloom, cache, bloom_cache));
+                  bloom_bytes, bloom_bits, pin_bloom, cache, raw_cache, bloom_cache));
   if (!sstable->file_.is_open()) return Status::IOError("failed to open sstable reader: " + path.string());
   out = std::move(sstable);
   return Status::OK();
@@ -516,6 +518,69 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
       return true;
     }
   }
+  std::shared_ptr<const std::string> raw_cached;
+  if (raw_cache_) {
+    if (raw_cache_->Get(path_ref_, start, raw_cached)) {
+      // Decode from raw cache.
+      const char* buf = raw_cached->data();
+      const std::size_t buf_size = raw_cached->size();
+      if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t)) return false;
+      std::uint32_t raw_size = 0;
+      std::uint32_t stored_size = 0;
+      std::uint8_t compression = 0;
+      std::memcpy(&raw_size, buf, sizeof(raw_size));
+      std::memcpy(&stored_size, buf + sizeof(raw_size), sizeof(stored_size));
+      std::memcpy(&compression, buf + sizeof(raw_size) + sizeof(stored_size), sizeof(compression));
+      const std::size_t header_bytes = sizeof(raw_size) + sizeof(stored_size) + sizeof(compression);
+      if (header_bytes + stored_size > buf_size) return false;
+
+      std::string raw;
+      std::string_view data_view;
+      if (compression != 0) {
+        if (!DecompressData(compression, raw_cached->substr(header_bytes, stored_size), raw, raw_size)) return false;
+        data_view = raw;
+      } else {
+        data_view = std::string_view(raw_cached->data() + header_bytes, raw_size);
+      }
+      if (data_view.size() != raw_size) return false;
+
+      auto vec = std::make_shared<std::vector<MemEntry>>();
+      vec->reserve(data_view.size() / 16 + 1);
+      std::size_t offset = 0;
+      while (offset < data_view.size()) {
+        if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
+        const std::uint8_t type = static_cast<std::uint8_t>(data_view[offset]);
+        offset += 1;
+        std::uint64_t seq = 0;
+        for (int i = 0; i < 8; ++i) seq |= static_cast<std::uint64_t>(static_cast<unsigned char>(data_view[offset + i])) << (8 * i);
+        offset += 8;
+        auto read32 = [&](std::size_t pos) -> std::uint32_t {
+          return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
+                 (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
+                 (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
+                 (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
+        };
+        const std::uint32_t key_size = read32(offset);
+        offset += 4;
+        const std::uint32_t value_size = read32(offset);
+        offset += 4;
+        if (offset + key_size + value_size > data_view.size()) break;
+        std::string key(data_view.substr(offset, key_size));
+        offset += key_size;
+        std::string value(data_view.substr(offset, value_size));
+        offset += value_size;
+        MemEntry e;
+        e.key = std::move(key);
+        e.value = std::move(value);
+        e.seq = seq;
+        e.deleted = type != 0;
+        vec->push_back(std::move(e));
+      }
+      if (cache_) cache_->Put(path_ref_, start, *vec);
+      out = std::move(vec);
+      return true;
+    }
+  }
 
   std::lock_guard lock(io_mu_);
   if (!file_.is_open()) return false;
@@ -572,6 +637,17 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
     e.seq = seq;
     e.deleted = type != 0;
     vec->push_back(std::move(e));
+  }
+  if (raw_cache_) {
+    // Store header + payload contiguous so未来解压可以直接使用。
+    std::string raw_block;
+    raw_block.resize(static_cast<std::size_t>(header_bytes + hdr.stored_size));
+    std::memcpy(raw_block.data(), &hdr.raw_size, sizeof(hdr.raw_size));
+    std::memcpy(raw_block.data() + sizeof(hdr.raw_size), &hdr.stored_size, sizeof(hdr.stored_size));
+    std::memcpy(raw_block.data() + sizeof(hdr.raw_size) + sizeof(hdr.stored_size), &hdr.compression,
+                sizeof(hdr.compression));
+    std::memcpy(raw_block.data() + header_bytes, payload.data(), hdr.stored_size);
+    raw_cache_->Put(path_ref_, start, std::move(raw_block));
   }
   if (cache_) cache_->Put(path_ref_, start, *vec);
   out = std::move(vec);

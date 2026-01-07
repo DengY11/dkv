@@ -69,4 +69,40 @@ class BlockCache {
   std::atomic<std::uint64_t> evictions_{0};
 };
 
+/*second cache*/
+class RawBlockCache {
+ public:
+  explicit RawBlockCache(std::size_t capacity_bytes) : capacity_bytes_(capacity_bytes) {}
+
+  bool Get(const std::shared_ptr<const std::string>& file, std::uint64_t offset,
+           std::shared_ptr<const std::string>& out);
+  void Put(const std::shared_ptr<const std::string>& file, std::uint64_t offset, std::string data);
+
+ private:
+  struct Key {
+    const std::string* file{nullptr};
+    std::uint64_t offset;
+    bool operator==(const Key& other) const { return file == other.file && offset == other.offset; }
+  };
+  struct KeyHash {
+    std::size_t operator()(const Key& k) const noexcept {
+      return std::hash<const void*>()(k.file) ^ (std::hash<std::uint64_t>()(k.offset) << 1);
+    }
+  };
+  struct Entry {
+    Key key;
+    std::shared_ptr<const std::string> file_ref;
+    std::shared_ptr<const std::string> data;
+    std::size_t bytes{0};
+  };
+
+  void EvictIfNeeded();
+
+  std::size_t capacity_bytes_{0};
+  std::size_t used_bytes_{0};
+  std::list<Entry> lru_;
+  std::unordered_map<Key, std::list<Entry>::iterator, KeyHash> map_;
+  std::mutex mu_;
+};
+
 }  // namespace dkv
