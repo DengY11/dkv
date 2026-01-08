@@ -49,6 +49,8 @@ struct Metrics {
   std::uint64_t compaction_output_bytes{0};
 
   std::uint64_t wal_syncs{0};
+  std::uint64_t sstable_crc_errors{0};
+  std::uint64_t sstable_read_errors{0};
 
   // Cache-level metrics
   std::uint64_t block_cache_hits{0};

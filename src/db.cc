@@ -44,6 +44,7 @@ class DB::Impl {
  public:
   explicit Impl(Options options)
       : options_(std::move(options)),
+        options_ptr_(std::make_shared<const Options>(options_)),
         data_dir_(options_.data_dir),
         wal_path_(data_dir_ / "wal.log"),
         sst_dir_(data_dir_ / "sst"),
@@ -96,6 +97,7 @@ class DB::Impl {
   Status WaitForAllCompactions();
 
   Options options_;
+  std::shared_ptr<const Options> options_ptr_;
   std::filesystem::path data_dir_;
   std::filesystem::path wal_path_;
   std::filesystem::path sst_dir_;
@@ -119,6 +121,8 @@ class DB::Impl {
   std::shared_ptr<BlockCache> block_cache_;
   std::shared_ptr<RawBlockCache> raw_block_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
+  std::atomic<std::uint64_t> sstable_crc_errors_{0};
+  std::atomic<std::uint64_t> sstable_read_errors_{0};
   std::mutex manifest_mu_;
   std::atomic<std::uint64_t> manifest_tmp_seq_{0};
   std::atomic<std::uint64_t> next_file_id_{1};
@@ -335,7 +339,8 @@ Status DB::Impl::LoadSSTables() {
       if (!parse_level(entry.path().filename().string(), level)) continue;
       std::shared_ptr<SSTable> table;
       bool pin_bloom = level > 0;
-      Status s = SSTable::Open(entry.path(), block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, table);
+      Status s = SSTable::Open(entry.path(), block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, table,
+                               options_ptr_, &sstable_crc_errors_, &sstable_read_errors_);
       if (!s.ok()) return s;
       ensure_level(level);
       loaded[level].push_back(TableRef{table, table->min_key(), table->max_key(), table->file_size()});
@@ -740,7 +745,8 @@ Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
     auto path = data_dir_ / path_str;
     std::shared_ptr<SSTable> table;
     bool pin_bloom = level > 0;
-    Status s = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, table);
+    Status s = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, table, options_ptr_,
+                              &sstable_crc_errors_, &sstable_read_errors_);
     if (!s.ok()) return s;
     ensure_level(level);
     loaded[level].push_back(TableRef{table, min_key, max_key, size == 0 ? table->file_size() : size});
@@ -910,7 +916,8 @@ Status DB::Impl::FlushImmutable(const std::shared_ptr<ImmutableMem>& imm) {
     if (!ws.ok()) return ws;
 
     std::shared_ptr<SSTable> table;
-    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, false, table);
+    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, false, table, options_ptr_,
+                       &sstable_crc_errors_, &sstable_read_errors_);
     if (!ws.ok()) return ws;
 
     new_tables.push_back(TableRef{table, table->min_key(), table->max_key(), table->file_size()});
@@ -1184,7 +1191,8 @@ Status DB::Impl::CompactLevel(std::size_t level) {
     if (!ws.ok()) return ws;
     std::shared_ptr<SSTable> t;
     bool pin_bloom = (level + 1) > 0;
-    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, t);
+    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, t, options_ptr_,
+                       &sstable_crc_errors_, &sstable_read_errors_);
     if (!ws.ok()) return ws;
     outputs.push_back(TableRef{t, t->min_key(), t->max_key(), t->file_size()});
     data.clear();
@@ -1321,6 +1329,8 @@ Metrics DB::Impl::GetMetrics() const {
   m.compaction_input_bytes = metrics_.compaction_input_bytes.load(std::memory_order_relaxed);
   m.compaction_output_bytes = metrics_.compaction_output_bytes.load(std::memory_order_relaxed);
   m.wal_syncs = metrics_.wal_syncs.load(std::memory_order_relaxed);
+  m.sstable_crc_errors = sstable_crc_errors_.load(std::memory_order_relaxed);
+  m.sstable_read_errors = sstable_read_errors_.load(std::memory_order_relaxed);
   if (block_cache_) {
     auto stats = block_cache_->GetStats();
     m.block_cache_hits = stats.hits;

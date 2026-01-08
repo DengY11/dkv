@@ -39,6 +39,9 @@ struct Options {
   std::size_t wal_sync_interval_ms{0};
   // Enable CRC32 for WAL records. Disable for performance experiments only.
   bool enable_crc{true};
+  // Verify SSTable block payload with CRC32 on read (adds ~4B per block). When false, CRC is still stored
+  // but skipped at read time to save CPU.
+  bool verify_sstable_crc{false};
   // Number of shards in memtable for concurrency (power of two recommended).
   std::size_t memtable_shard_count{16};
   bool enable_compress{false};

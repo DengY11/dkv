@@ -1,6 +1,7 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include <iostream>
 #include <random>
@@ -299,6 +300,92 @@ bool TestCompressionOption() {
   return true;
 }
 
+bool TestSSTableCrcStats() {
+  auto dir = TempDir("dkv-crc-stats");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 32;  // small to force a tiny SST
+  opts.verify_sstable_crc = true;
+
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db crc stats")) return false;
+
+  dkv::WriteOptions wopts;
+  if (!ExpectOk(db->Put(wopts, "c-key", "value1"), "put crc key")) return false;
+  if (!ExpectOk(db->Flush(), "flush crc")) return false;
+  db.reset();  // close before corrupting file
+
+  auto sst_dir = dir / "sst";
+  std::filesystem::path sst_path;
+  if (std::filesystem::exists(sst_dir)) {
+    for (const auto& entry : std::filesystem::directory_iterator(sst_dir)) {
+      if (entry.is_regular_file() && entry.path().extension() == ".sst") {
+        sst_path = entry.path();
+        break;
+      }
+    }
+  }
+  if (sst_path.empty()) {
+    std::cerr << "no sstable found to corrupt\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  // Flip one byte in the first block payload to trigger CRC failure.
+  std::fstream f(sst_path, std::ios::in | std::ios::out | std::ios::binary);
+  if (!f.is_open()) {
+    std::cerr << "failed to open sstable for corruption\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  constexpr std::streamoff kPayloadOffset = 4 + 4 + 1 + 4;  // header bytes
+  f.seekg(0, std::ios::end);
+  const auto size = f.tellg();
+  if (size <= kPayloadOffset) {
+    std::cerr << "sstable too small to corrupt\n";
+    f.close();
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  f.seekg(kPayloadOffset);
+  char byte = 0;
+  f.read(&byte, 1);
+  if (!f) {
+    std::cerr << "failed to read payload byte\n";
+    f.close();
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  byte ^= static_cast<char>(0xFF);
+  f.seekp(kPayloadOffset);
+  f.write(&byte, 1);
+  f.flush();
+  f.close();
+
+  // Reopen and trigger a read to increment counters.
+  if (!ExpectOk(dkv::DB::Open(opts, db), "reopen after corruption")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  std::string value;
+  auto s = db->Get(dkv::ReadOptions{}, "c-key", value);
+  if (s.ok()) {
+    std::cerr << "expected get to fail after corruption\n";
+    db.reset();
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  dkv::Metrics m = db->GetMetrics();
+  db.reset();
+  std::filesystem::remove_all(dir);
+  if (m.sstable_crc_errors == 0 || m.sstable_read_errors == 0) {
+    std::cerr << "expected crc/read error counters to increment, got crc=" << m.sstable_crc_errors
+              << " read=" << m.sstable_read_errors << "\n";
+    return false;
+  }
+  return true;
+}
+
 bool TestBatchWrite() {
   auto dir = TempDir("dkv-batch");
   dkv::Options opts;
@@ -539,6 +626,7 @@ int main() {
   ok &= TestIteratorAndSnapshot();
   ok &= TestSnapshotIsolationAndLargeScan();
   ok &= TestCompressionOption();
+  ok &= TestSSTableCrcStats();
   ok &= TestBatchWrite();
   ok &= TestFuzzAgainstModel();
   ok &= TestFuzzWithReopen();

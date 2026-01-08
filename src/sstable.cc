@@ -31,6 +31,7 @@ struct BlockHeader {
   std::uint32_t raw_size{0};
   std::uint32_t stored_size{0};
   std::uint8_t compression{0};  // 0 = none, 1 = snappy
+  std::uint32_t crc{0};         // CRC32 of raw payload (uncompressed)
 };
 
 static bool DecompressData(std::uint8_t code, std::string_view input, std::string& output, std::size_t raw_size);
@@ -53,10 +54,10 @@ constexpr std::uint8_t kCompressionCode = 2;
 #elif DKV_USE_LZ4
 constexpr std::uint8_t kCompressionCode = 3;
 #else
-constexpr std::uint8_t kCompressionCode = 0;
-#endif
+  constexpr std::uint8_t kCompressionCode = 0;
+  #endif
 
-bool CompressData(std::string_view input, std::string& output, std::uint8_t& code) {
+  bool CompressData(std::string_view input, std::string& output, std::uint8_t& code) {
   output.clear();
   code = 0;
 #if DKV_USE_SNAPPY
@@ -181,10 +182,12 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     hdr.raw_size = static_cast<std::uint32_t>(block_buf.size());
     hdr.stored_size = static_cast<std::uint32_t>(payload.size());
     hdr.compression = use_compression ? comp_code : 0;
+    hdr.crc = CRC32(block_buf);
 
     WriteU32(out, hdr.raw_size);
     WriteU32(out, hdr.stored_size);
     WriteU8(out, hdr.compression);
+    WriteU32(out, hdr.crc);
     out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (!out) return Status::IOError("failed to write block");
     std::uint64_t end = static_cast<std::uint64_t>(out.tellp());
@@ -263,7 +266,8 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
                  std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
                  std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
                  std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
-                 std::shared_ptr<BloomCache> bloom_cache)
+                 std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<const Options> options,
+                 std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors)
     : path_(std::move(path)),
       path_ref_(std::make_shared<std::string>(path_.string())),
       blocks_(std::move(index)),
@@ -275,6 +279,9 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
       cache_(std::move(cache)),
       raw_cache_(std::move(raw_cache)),
       bloom_cache_(std::move(bloom_cache)),
+      options_(std::move(options)),
+      crc_error_counter_(crc_errors),
+      read_error_counter_(read_errors),
       bloom_bytes_(bloom_bytes),
       bloom_bits_per_key_(bloom_bits_per_key),
       pin_bloom_(pin_bloom),
@@ -334,7 +341,8 @@ std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
 
 Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     const std::shared_ptr<RawBlockCache>& raw_cache, const std::shared_ptr<BloomCache>& bloom_cache,
-                    bool pin_bloom, std::shared_ptr<SSTable>& out) {
+                    bool pin_bloom, std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
+                    std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors) {
   auto size_opt = FileSize(path);
   if (!size_opt) return Status::IOError("unable to stat sstable: " + path.string());
 
@@ -372,10 +380,12 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
   // Derive max_key by reading the last block's last entry.
   in.seekg(static_cast<std::streamoff>(index.back().offset));
   BlockHeader hdr;
-  if (!ReadU32(in, hdr.raw_size) || !ReadU32(in, hdr.stored_size) || !ReadU8(in, hdr.compression)) {
+  if (!ReadU32(in, hdr.raw_size) || !ReadU32(in, hdr.stored_size) || !ReadU8(in, hdr.compression) ||
+      !ReadU32(in, hdr.crc)) {
     return Status::Corruption("failed to read block header: " + path.string());
   }
-  if (index.back().size < sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + hdr.stored_size) {
+  if (index.back().size <
+      sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + sizeof(hdr.crc) + hdr.stored_size) {
     return Status::Corruption("block size too small: " + path.string());
   }
   std::string payload(hdr.stored_size, '\0');
@@ -425,7 +435,8 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
 
   auto sstable = std::shared_ptr<SSTable>(
       new SSTable(path, std::move(index), index.front().key, max_key, footer.max_seq, *size_opt, footer.bloom_start,
-                  bloom_bytes, bloom_bits, pin_bloom, cache, raw_cache, bloom_cache));
+                  bloom_bytes, bloom_bits, pin_bloom, cache, raw_cache, bloom_cache, std::move(options), crc_errors,
+                  read_errors));
   if (!sstable->file_.is_open()) return Status::IOError("failed to open sstable reader: " + path.string());
   out = std::move(sstable);
   return Status::OK();
@@ -522,27 +533,53 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
   if (raw_cache_) {
     if (raw_cache_->Get(path_ref_, start, raw_cached)) {
       // Decode from raw cache.
+      auto record_read_error = [&]() {
+        if (read_error_counter_) read_error_counter_->fetch_add(1, std::memory_order_relaxed);
+      };
       const char* buf = raw_cached->data();
       const std::size_t buf_size = raw_cached->size();
-      if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t)) return false;
+      if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t) + sizeof(std::uint32_t)) {
+        record_read_error();
+        return false;
+      }
       std::uint32_t raw_size = 0;
       std::uint32_t stored_size = 0;
       std::uint8_t compression = 0;
+      std::uint32_t hdr_crc = 0;
       std::memcpy(&raw_size, buf, sizeof(raw_size));
       std::memcpy(&stored_size, buf + sizeof(raw_size), sizeof(stored_size));
       std::memcpy(&compression, buf + sizeof(raw_size) + sizeof(stored_size), sizeof(compression));
-      const std::size_t header_bytes = sizeof(raw_size) + sizeof(stored_size) + sizeof(compression);
-      if (header_bytes + stored_size > buf_size) return false;
+      std::memcpy(&hdr_crc, buf + sizeof(raw_size) + sizeof(stored_size) + sizeof(compression), sizeof(hdr_crc));
+      const std::size_t header_bytes =
+          sizeof(raw_size) + sizeof(stored_size) + sizeof(compression) + sizeof(hdr_crc);
+      if (header_bytes + stored_size > buf_size) {
+        record_read_error();
+        return false;
+      }
 
       std::string raw;
       std::string_view data_view;
       if (compression != 0) {
-        if (!DecompressData(compression, raw_cached->substr(header_bytes, stored_size), raw, raw_size)) return false;
+        if (!DecompressData(compression, raw_cached->substr(header_bytes, stored_size), raw, raw_size)) {
+          record_read_error();
+          return false;
+        }
         data_view = raw;
       } else {
         data_view = std::string_view(raw_cached->data() + header_bytes, raw_size);
       }
-      if (data_view.size() != raw_size) return false;
+      if (data_view.size() != raw_size) {
+        record_read_error();
+        return false;
+      }
+      if (options_ && options_->verify_sstable_crc) {
+        const auto crc = CRC32(data_view);
+        if (crc != hdr_crc) {
+          if (crc_error_counter_) crc_error_counter_->fetch_add(1, std::memory_order_relaxed);
+          record_read_error();
+          return false;
+        }
+      }
 
       auto vec = std::make_shared<std::vector<MemEntry>>();
       vec->reserve(data_view.size() / 16 + 1);
@@ -582,29 +619,67 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
     }
   }
 
+  auto record_read_error = [&]() {
+    if (read_error_counter_) read_error_counter_->fetch_add(1, std::memory_order_relaxed);
+  };
+
   std::lock_guard lock(io_mu_);
-  if (!file_.is_open()) return false;
+  if (!file_.is_open()) {
+    record_read_error();
+    return false;
+  }
   file_.clear();
   file_.seekg(static_cast<std::streamoff>(start));
 
   BlockHeader hdr;
-  if (!ReadU32(file_, hdr.raw_size) || !ReadU32(file_, hdr.stored_size)) return false;
-  if (!ReadU8(file_, hdr.compression)) return false;
-  const std::uint64_t header_bytes = sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression);
-  if (header_bytes + hdr.stored_size > size) return false;
+  if (!ReadU32(file_, hdr.raw_size) || !ReadU32(file_, hdr.stored_size)) {
+    record_read_error();
+    return false;
+  }
+  if (!ReadU8(file_, hdr.compression)) {
+    record_read_error();
+    return false;
+  }
+  if (!ReadU32(file_, hdr.crc)) {
+    record_read_error();
+    return false;
+  }
+  const std::uint64_t header_bytes =
+      sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + sizeof(hdr.crc);
+  if (header_bytes + hdr.stored_size > size) {
+    record_read_error();
+    return false;
+  }
 
   std::string payload(hdr.stored_size, '\0');
-  if (!file_.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) return false;
+  if (!file_.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) {
+    record_read_error();
+    return false;
+  }
 
   std::string raw;
   std::string_view data_view;
   if (hdr.compression != 0) {
-    if (!DecompressData(hdr.compression, payload, raw, hdr.raw_size)) return false;
+    if (!DecompressData(hdr.compression, payload, raw, hdr.raw_size)) {
+      record_read_error();
+      return false;
+    }
     data_view = raw;
   } else {
     data_view = payload;
   }
-  if (data_view.size() != hdr.raw_size) return false;
+  if (data_view.size() != hdr.raw_size) {
+    record_read_error();
+    return false;
+  }
+  if (options_ && options_->verify_sstable_crc) {
+    const auto crc = CRC32(data_view);
+    if (crc != hdr.crc) {
+      if (crc_error_counter_) crc_error_counter_->fetch_add(1, std::memory_order_relaxed);
+      record_read_error();
+      return false;
+    }
+  }
 
   auto vec = std::make_shared<std::vector<MemEntry>>();
   vec->reserve(data_view.size() / 16 + 1);
@@ -639,13 +714,14 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
     vec->push_back(std::move(e));
   }
   if (raw_cache_) {
-    // Store header + payload contiguous so未来解压可以直接使用。
     std::string raw_block;
     raw_block.resize(static_cast<std::size_t>(header_bytes + hdr.stored_size));
     std::memcpy(raw_block.data(), &hdr.raw_size, sizeof(hdr.raw_size));
     std::memcpy(raw_block.data() + sizeof(hdr.raw_size), &hdr.stored_size, sizeof(hdr.stored_size));
     std::memcpy(raw_block.data() + sizeof(hdr.raw_size) + sizeof(hdr.stored_size), &hdr.compression,
                 sizeof(hdr.compression));
+    std::memcpy(raw_block.data() + sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression),
+                &hdr.crc, sizeof(hdr.crc));
     std::memcpy(raw_block.data() + header_bytes, payload.data(), hdr.stored_size);
     raw_cache_->Put(path_ref_, start, std::move(raw_block));
   }

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -26,7 +27,8 @@ class SSTable {
                      std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     const std::shared_ptr<RawBlockCache>& raw_cache, const std::shared_ptr<BloomCache>& bloom_cache,
-                    bool pin_bloom, std::shared_ptr<SSTable>& out);
+                    bool pin_bloom, std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
+                    std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors);
 
   bool Get(std::string_view key, MemEntry& entry) const;
   Status LoadAll(std::vector<MemEntry>& out) const;
@@ -52,7 +54,8 @@ class SSTable {
           std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
           std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
           std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
-          std::shared_ptr<BloomCache> bloom_cache);
+          std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<const Options> options,
+          std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors);
 
   std::shared_ptr<BloomCache::Data> LoadBloom() const;
 
@@ -73,6 +76,9 @@ class SSTable {
   std::shared_ptr<BlockCache> cache_;
   std::shared_ptr<RawBlockCache> raw_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
+  std::shared_ptr<const Options> options_;
+  std::atomic<std::uint64_t>* crc_error_counter_{nullptr};
+  std::atomic<std::uint64_t>* read_error_counter_{nullptr};
   std::uint32_t bloom_bytes_{0};
   std::uint32_t bloom_bits_per_key_{0};
   bool pin_bloom_{false};
