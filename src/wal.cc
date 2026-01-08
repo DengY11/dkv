@@ -64,8 +64,8 @@ Status WAL::Replay(const std::function<void(std::uint64_t, bool, std::string&&, 
     if (!ReadU8(in, type)) break;
 
     std::uint64_t seq = 0;
-  std::uint32_t key_size = 0;
-  std::uint32_t value_size = 0;
+    std::uint32_t key_size = 0;
+    std::uint32_t value_size = 0;
     if (!ReadU64(in, seq) || !ReadU32(in, key_size) || !ReadU32(in, value_size)) break;
     std::string key(key_size, '\0');
     if (!in.read(key.data(), static_cast<std::streamsize>(key_size))) break;
