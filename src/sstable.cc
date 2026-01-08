@@ -433,10 +433,11 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     return Status::Corruption("bad bloom header: " + path.string());
   }
 
-  auto sstable = std::shared_ptr<SSTable>(
-      new SSTable(path, std::move(index), index.front().key, max_key, footer.max_seq, *size_opt, footer.bloom_start,
-                  bloom_bytes, bloom_bits, pin_bloom, cache, raw_cache, bloom_cache, std::move(options), crc_errors,
-                  read_errors));
+  std::string min_key = index.front().key;
+  auto sstable = std::shared_ptr<SSTable>(new SSTable(path, std::move(index), std::move(min_key), max_key,
+                                                      footer.max_seq, *size_opt, footer.bloom_start, bloom_bytes,
+                                                      bloom_bits, pin_bloom, cache, raw_cache, bloom_cache,
+                                                      std::move(options), crc_errors, read_errors));
   if (!sstable->file_.is_open()) return Status::IOError("failed to open sstable reader: " + path.string());
   out = std::move(sstable);
   return Status::OK();
