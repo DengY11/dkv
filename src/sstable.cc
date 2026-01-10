@@ -311,7 +311,7 @@ std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
     std::vector<std::uint8_t> bits(bloom_bytes_, 0);
     {
       std::lock_guard lock(io_mu_);
-      if (!file_.is_open()) return nullptr;
+      if (!file_.is_open())[[unlikely]] return nullptr;
       file_.clear();
       file_.seekg(static_cast<std::streamoff>(bloom_start_));
       std::uint32_t bits_per_key = 0;
@@ -344,16 +344,16 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
                     bool pin_bloom, std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
                     std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors) {
   auto size_opt = FileSize(path);
-  if (!size_opt) return Status::IOError("unable to stat sstable: " + path.string());
+  if (!size_opt)[[unlikely]] return Status::IOError("unable to stat sstable: " + path.string());
 
   std::ifstream in(path, std::ios::binary);
-  if (!in.is_open()) return Status::IOError("failed to open sstable: " + path.string());
+  if (!in.is_open())[[unlikely]] return Status::IOError("failed to open sstable: " + path.string());
 
   ParsedFooter footer;
-  if (!ReadFooter(in, *size_opt, footer)) {
+  if (!ReadFooter(in, *size_opt, footer))[[unlikely]] {
     return Status::Corruption("failed to read sstable footer: " + path.string());
   }
-  if (footer.index_start > *size_opt || footer.bloom_start > *size_opt) {
+  if (footer.index_start > *size_opt || footer.bloom_start > *size_opt)[[unlikely]] {
     return Status::Corruption("sstable index/bloom out of range: " + path.string());
   }
 
@@ -375,7 +375,7 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     index.push_back(BlockIndexEntry{std::move(key), offset, size});
   }
 
-  if (index.empty()) return Status::Corruption("empty index in sstable: " + path.string());
+  if (index.empty())[[unlikely]] return Status::Corruption("empty index in sstable: " + path.string());
 
   // Derive max_key by reading the last block's last entry.
   in.seekg(static_cast<std::streamoff>(index.back().offset));
@@ -539,7 +539,7 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
       };
       const char* buf = raw_cached->data();
       const std::size_t buf_size = raw_cached->size();
-      if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t) + sizeof(std::uint32_t)) {
+      if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t) + sizeof(std::uint32_t))[[unlikely]] {
         record_read_error();
         return false;
       }
@@ -553,7 +553,7 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
       std::memcpy(&hdr_crc, buf + sizeof(raw_size) + sizeof(stored_size) + sizeof(compression), sizeof(hdr_crc));
       const std::size_t header_bytes =
           sizeof(raw_size) + sizeof(stored_size) + sizeof(compression) + sizeof(hdr_crc);
-      if (header_bytes + stored_size > buf_size) {
+      if (header_bytes + stored_size > buf_size)[[unlikely]] {
         record_read_error();
         return false;
       }
@@ -647,7 +647,7 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
   }
   const std::uint64_t header_bytes =
       sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + sizeof(hdr.crc);
-  if (header_bytes + hdr.stored_size > size) {
+  if (header_bytes + hdr.stored_size > size)[[unlikely]] {
     record_read_error();
     return false;
   }
