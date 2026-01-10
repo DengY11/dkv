@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cstdint>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -297,6 +298,130 @@ bool TestCompressionOption() {
   assert(value == std::string(16, 'c'));
 
   cleanup();
+  return true;
+}
+
+bool TestBlockBloomFilters() {
+  auto dir = TempDir("dkv-block-bloom");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 32;
+  opts.block_bloom_bits_per_key = 8;
+
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db block bloom")) return false;
+  dkv::WriteOptions wopts;
+  for (int i = 0; i < 3; ++i) {
+    db->Put(wopts, "b" + std::to_string(i), "v" + std::to_string(i));
+  }
+  if (!ExpectOk(db->Flush(), "flush block bloom")) return false;
+  db.reset();
+
+  std::filesystem::path sst_path;
+  auto sst_dir = dir / "sst";
+  for (const auto& entry : std::filesystem::directory_iterator(sst_dir)) {
+    if (entry.is_regular_file() && entry.path().extension() == ".sst") {
+      sst_path = entry.path();
+      break;
+    }
+  }
+  if (sst_path.empty()) {
+    std::cerr << "no sstable found for block bloom\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  auto read32 = [](std::istream& in, std::uint32_t& v) -> bool {
+    char buf[4];
+    if (!in.read(buf, 4)) return false;
+    v = static_cast<std::uint32_t>(static_cast<unsigned char>(buf[0])) |
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(buf[1])) << 8) |
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(buf[2])) << 16) |
+        (static_cast<std::uint32_t>(static_cast<unsigned char>(buf[3])) << 24);
+    return true;
+  };
+  auto read64 = [](std::istream& in, std::uint64_t& v) -> bool {
+    char buf[8];
+    if (!in.read(buf, 8)) return false;
+    v = 0;
+    for (int i = 7; i >= 0; --i) {
+      v <<= 8u;
+      v |= static_cast<std::uint64_t>(static_cast<unsigned char>(buf[i]));
+    }
+    return true;
+  };
+
+  std::ifstream in(sst_path, std::ios::binary);
+  if (!in.is_open()) {
+    std::cerr << "failed to open sstable\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  in.seekg(0, std::ios::end);
+  auto file_size = static_cast<std::uint64_t>(in.tellg());
+  constexpr std::uint64_t footer_size = sizeof(std::uint64_t) * 5 + sizeof(std::uint32_t) * 2;
+  if (file_size < footer_size) {
+    std::cerr << "sstable too small\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  in.seekg(static_cast<std::streamoff>(file_size - footer_size));
+  std::uint64_t index_start = 0, bloom_start = 0, filter_start = 0, filter_index_start = 0, max_seq = 0;
+  std::uint32_t block_count = 0, magic = 0;
+  if (!read64(in, index_start) || !read64(in, bloom_start) || !read64(in, filter_start) ||
+      !read64(in, filter_index_start) || !read64(in, max_seq) || !read32(in, block_count) || !read32(in, magic)) {
+    std::cerr << "failed to read footer\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  if (magic != 0xD15EEDu || filter_start == 0 || filter_index_start == 0 || block_count == 0) {
+    std::cerr << "block filter footer invalid\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  in.seekg(static_cast<std::streamoff>(filter_start));
+  std::uint32_t bpk = 0, k = 0;
+  if (!read32(in, bpk) || !read32(in, k) || bpk == 0 || k == 0) {
+    std::cerr << "block filter header invalid\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  in.seekg(static_cast<std::streamoff>(filter_index_start));
+  std::vector<std::uint64_t> offsets(block_count, 0);
+  for (std::uint32_t i = 0; i < block_count; ++i) {
+    if (!read64(in, offsets[i])) {
+      std::cerr << "block filter index invalid\n";
+      std::filesystem::remove_all(dir);
+      return false;
+    }
+  }
+  if (offsets[0] == 0) {
+    std::cerr << "first block filter offset missing\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  in.seekg(static_cast<std::streamoff>(offsets[0]));
+  std::uint32_t filter_bytes = 0;
+  if (!read32(in, filter_bytes) || filter_bytes == 0) {
+    std::cerr << "block filter length invalid\n";
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  if (!ExpectOk(dkv::DB::Open(opts, db), "reopen block bloom db")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  std::string value;
+  if (!ExpectOk(db->Get(dkv::ReadOptions{}, "b0", value), "get block bloom key")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  assert(value == "v0");
+  db.reset();
+  std::filesystem::remove_all(dir);
   return true;
 }
 
@@ -626,6 +751,7 @@ int main() {
   ok &= TestIteratorAndSnapshot();
   ok &= TestSnapshotIsolationAndLargeScan();
   ok &= TestCompressionOption();
+  ok &= TestBlockBloomFilters();
   ok &= TestSSTableCrcStats();
   ok &= TestBatchWrite();
   ok &= TestFuzzAgainstModel();

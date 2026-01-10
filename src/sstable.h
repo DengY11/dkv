@@ -22,12 +22,15 @@ namespace dkv {
 class SSTable {
  public:
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress,
+                     std::size_t block_bloom_bits_per_key);
   static Status Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress,
+                     std::size_t block_bloom_bits_per_key);
   static Status Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     const std::shared_ptr<RawBlockCache>& raw_cache, const std::shared_ptr<BloomCache>& bloom_cache,
-                    bool pin_bloom, std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
+                    const std::shared_ptr<BloomCache>& block_bloom_cache, bool pin_bloom,
+                    std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
                     std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors);
 
   bool Get(std::string_view key, MemEntry& entry) const;
@@ -54,10 +57,14 @@ class SSTable {
           std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
           std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
           std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
-          std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<const Options> options,
-          std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors);
+          std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<BloomCache> block_bloom_cache,
+          std::shared_ptr<const Options> options, std::atomic<std::uint64_t>* crc_errors,
+          std::atomic<std::uint64_t>* read_errors, std::vector<std::uint64_t> block_filter_offsets,
+          std::uint32_t block_filter_bits_per_key, std::uint32_t block_filter_hash_count,
+          std::uint64_t block_filter_start);
 
   std::shared_ptr<BloomCache::Data> LoadBloom() const;
+  std::shared_ptr<BloomCache::Data> LoadBlockBloom(std::size_t block_index) const;
 
   bool ReadEntryRange(std::uint64_t start, std::uint64_t end, std::string_view key, MemEntry& entry) const;
   bool ReadBlockRange(std::uint64_t start, std::uint64_t end,
@@ -76,11 +83,17 @@ class SSTable {
   std::shared_ptr<BlockCache> cache_;
   std::shared_ptr<RawBlockCache> raw_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
+  std::shared_ptr<BloomCache> block_bloom_cache_;
   std::shared_ptr<const Options> options_;
   std::atomic<std::uint64_t>* crc_error_counter_{nullptr};
   std::atomic<std::uint64_t>* read_error_counter_{nullptr};
   std::uint32_t bloom_bytes_{0};
   std::uint32_t bloom_bits_per_key_{0};
+  std::vector<std::uint64_t> block_filter_offsets_;
+  std::uint32_t block_filter_bits_per_key_{0};
+  std::uint32_t block_filter_hash_count_{0};
+  std::uint64_t block_filter_start_{0};
+  bool has_block_filters_{false};
   bool pin_bloom_{false};
   mutable std::weak_ptr<BloomCache::Data> bloom_ref_;
   mutable std::shared_ptr<BloomCache::Data> pinned_bloom_;

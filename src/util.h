@@ -11,7 +11,11 @@
 namespace dkv {
 
 constexpr std::uint32_t kSSTableMagic = 0xD15EEDu;
-constexpr std::size_t kSSTableFooterSize = sizeof(std::uint64_t) * 3 + sizeof(std::uint32_t) * 2;
+// V1 footer: index_start, bloom_start, max_seq, block_count, magic.
+constexpr std::size_t kSSTableFooterSizeV1 = sizeof(std::uint64_t) * 3 + sizeof(std::uint32_t) * 2;
+// V2 footer adds block filter start/index offsets.
+constexpr std::size_t kSSTableFooterSizeV2 = sizeof(std::uint64_t) * 5 + sizeof(std::uint32_t) * 2;
+constexpr std::size_t kSSTableFooterSize = kSSTableFooterSizeV2;
 
 inline void WriteU8(std::ostream& os, std::uint8_t value) { os.write(reinterpret_cast<const char*>(&value), 1); }
 

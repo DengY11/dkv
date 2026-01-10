@@ -47,7 +47,7 @@ void BenchPut(std::size_t n, std::size_t key_len, std::size_t value_len, std::si
   opts.memtable_soft_limit_bytes = 512 * 1024 * 1024;
   opts.sync_wal = false;
   opts.sstable_block_size_bytes = 64*  1024 * 1024;
-  opts.bloom_bits_per_key = 8;
+  opts.table_bloom_bits_per_key = 8;
   opts.level0_file_limit = 4;
   opts.sstable_target_size_bytes = 256 * 1024 * 1024;
   opts.flush_thread_count = 2;

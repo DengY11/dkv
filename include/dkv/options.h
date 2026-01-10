@@ -15,10 +15,14 @@ struct Options {
   std::size_t sstable_target_size_bytes{8 * 1024 * 1024};
   // SSTable block size for data blocks.
   std::size_t sstable_block_size_bytes{4 * 1024};
-  // Bloom filter bits per key.
-  std::size_t bloom_bits_per_key{10};
-  // Bloom cache size in bytes (0 disables bloom cache; bloom then loads lazily per use).
-  std::size_t bloom_cache_capacity_bytes{0};
+  // Block-level bloom bits per key (0 disables block-level filters).
+  std::size_t block_bloom_bits_per_key{8};
+  // SSTable-level Bloom filter bits per key.
+  std::size_t table_bloom_bits_per_key{10};
+  // SSTable-level Bloom cache size in bytes (0 disables bloom cache; bloom then loads lazily per use).
+  std::size_t table_bloom_cache_capacity_bytes{0};
+  // Block-level Bloom cache size (0 disables block bloom cache; reserved for block filters).
+  std::size_t block_bloom_cache_capacity_bytes{32 * 1024 * 1024};
   // Secondary cache,raw data in memory which need to uncompress  
   std::size_t raw_block_cache_capacity_bytes{0};
   // Block cache size in bytes (0 disables cache).

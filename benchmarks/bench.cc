@@ -114,7 +114,7 @@ CrudStats BenchDKVSingle(const Args& args, Mode mode) {
   opts.memtable_soft_limit_bytes = 128 * 1024 * 1024;
   opts.sync_wal = sync;
   opts.sstable_block_size_bytes = 16 * 1024;
-  opts.bloom_bits_per_key = 8;
+  opts.table_bloom_bits_per_key = 8;
   opts.level0_file_limit = 4;
   opts.sstable_target_size_bytes = 64 * 1024 * 1024;
   opts.max_immutable_memtables = 4;
@@ -123,7 +123,9 @@ CrudStats BenchDKVSingle(const Args& args, Mode mode) {
   opts.block_cache_capacity_bytes = 2ull * 1024 * 1024 * 1024;  // force 64-bit to avoid overflow
   opts.raw_block_cache_capacity_bytes = 3ull * 1024 *1024 *1024;
   opts.wal_sync_interval_ms = sync ? 0 : 5;
-  opts.bloom_cache_capacity_bytes = 512 * 1024 * 1024;
+  opts.table_bloom_cache_capacity_bytes = 512 * 1024 * 1024;
+  opts.block_bloom_cache_capacity_bytes = 256 * 1024 * 1024;
+  opts.block_bloom_bits_per_key = 8;
   std::unique_ptr<dkv::DB> db;
   EnsureOk(dkv::DB::Open(opts, db), "open dkv");
 

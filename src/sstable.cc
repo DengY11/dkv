@@ -23,8 +23,11 @@ namespace {
 struct ParsedFooter {
   std::uint64_t index_start{0};
   std::uint64_t bloom_start{0};
+  std::uint64_t block_filter_start{0};
+  std::uint64_t block_filter_index_start{0};
   std::uint64_t max_seq{0};
   std::uint32_t block_count{0};
+  bool has_block_filters{false};
 };
 
 struct BlockHeader {
@@ -135,7 +138,7 @@ static bool DecompressData(std::uint8_t code, std::string_view input, std::strin
 
 template <typename Entry>
 Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& entries, std::size_t block_size,
-                 std::size_t bloom_bits_per_key, bool enable_compress) {
+                 std::size_t bloom_bits_per_key, bool enable_compress, std::size_t block_bloom_bits_per_key) {
   if (entries.empty()) return Status::InvalidArgument("no entries to write");
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
@@ -161,8 +164,20 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
   std::uint64_t block_start = static_cast<std::uint64_t>(out.tellp());
   std::string block_buf;
   block_buf.reserve(block_size * 2);
+  std::vector<std::string_view> current_block_keys;
+  current_block_keys.reserve(256);
+  std::vector<std::vector<std::uint8_t>> block_bloom_bits;
+  std::uint32_t block_filter_k = 0;
   auto flush_block = [&]() -> Status {
     if (block_buf.empty()) return Status::OK();
+    if (block_bloom_bits_per_key > 0 && !current_block_keys.empty()) {
+      auto bf = BloomFilter::Build(current_block_keys, static_cast<std::uint32_t>(block_bloom_bits_per_key));
+      block_filter_k = bf.hash_count();
+      block_bloom_bits.push_back(bf.data());
+    } else if (block_bloom_bits_per_key > 0) {
+      block_bloom_bits.push_back({});
+    }
+    current_block_keys.clear();
     // Compress block if enabled.
     std::string compressed;
     bool use_compression = enable_compress && kCompressionCode != 0;
@@ -204,6 +219,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     const std::string_view key_view = e.key;
     const std::string_view value_view = e.value;
     bloom_keys.push_back(key_view);
+    if (block_bloom_bits_per_key > 0) current_block_keys.push_back(key_view);
     max_seq = std::max(max_seq, e.seq);
 
     const auto before = block_buf.size();
@@ -231,6 +247,27 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
   out.write(reinterpret_cast<const char*>(bloom.data().data()),
             static_cast<std::streamsize>(bloom.data().size()));
 
+  std::uint64_t block_filter_start = 0;
+  std::uint64_t block_filter_index_start = 0;
+  std::vector<std::uint64_t> block_filter_offsets;
+  if (block_bloom_bits_per_key > 0 && !block_bloom_bits.empty()) {
+    block_filter_start = static_cast<std::uint64_t>(out.tellp());
+    WriteU32(out, static_cast<std::uint32_t>(block_bloom_bits_per_key));
+    WriteU32(out, block_filter_k);
+    block_filter_offsets.resize(block_bloom_bits.size(), 0);
+    for (std::size_t i = 0; i < block_bloom_bits.size(); ++i) {
+      if (block_bloom_bits[i].empty()) continue;
+      block_filter_offsets[i] = static_cast<std::uint64_t>(out.tellp());
+      WriteU32(out, static_cast<std::uint32_t>(block_bloom_bits[i].size()));
+      out.write(reinterpret_cast<const char*>(block_bloom_bits[i].data()),
+                static_cast<std::streamsize>(block_bloom_bits[i].size()));
+    }
+    block_filter_index_start = static_cast<std::uint64_t>(out.tellp());
+    for (auto off : block_filter_offsets) {
+      WriteU64(out, off);
+    }
+  }
+
   const auto index_start = static_cast<std::uint64_t>(out.tellp());
   for (const auto& idx : blocks) {
     WriteU32(out, static_cast<std::uint32_t>(idx.key.size()));
@@ -241,6 +278,8 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
 
   WriteU64(out, index_start);
   WriteU64(out, bloom_start);
+  WriteU64(out, block_filter_start);
+  WriteU64(out, block_filter_index_start);
   WriteU64(out, max_seq);
   WriteU32(out, static_cast<std::uint32_t>(blocks.size()));
   WriteU32(out, kSSTableMagic);
@@ -250,14 +289,36 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
 }
 
 bool ReadFooter(std::ifstream& in, std::uint64_t file_size, ParsedFooter& footer) {
-  if (file_size < kSSTableFooterSize) return false;
-  in.seekg(static_cast<std::streamoff>(file_size - kSSTableFooterSize));
+  if (file_size < kSSTableFooterSizeV1) return false;
+
+  auto read_v2 = [&]() -> bool {
+    if (file_size < kSSTableFooterSizeV2) return false;
+    in.seekg(static_cast<std::streamoff>(file_size - kSSTableFooterSizeV2));
+    std::uint32_t magic = 0;
+    if (!ReadU64(in, footer.index_start) || !ReadU64(in, footer.bloom_start) ||
+        !ReadU64(in, footer.block_filter_start) || !ReadU64(in, footer.block_filter_index_start) ||
+        !ReadU64(in, footer.max_seq) || !ReadU32(in, footer.block_count) || !ReadU32(in, magic)) {
+      return false;
+    }
+    if (magic != kSSTableMagic) return false;
+    footer.has_block_filters = footer.block_filter_start != 0 && footer.block_filter_index_start != 0;
+    return true;
+  };
+
+  if (read_v2()) return true;
+
+  // Fallback to V1 (no block filters).
+  in.seekg(static_cast<std::streamoff>(file_size - kSSTableFooterSizeV1));
   std::uint32_t magic = 0;
   if (!ReadU64(in, footer.index_start) || !ReadU64(in, footer.bloom_start) || !ReadU64(in, footer.max_seq) ||
       !ReadU32(in, footer.block_count) || !ReadU32(in, magic)) {
     return false;
   }
-  return magic == kSSTableMagic;
+  if (magic != kSSTableMagic) return false;
+  footer.block_filter_start = 0;
+  footer.block_filter_index_start = 0;
+  footer.has_block_filters = false;
+  return true;
 }
 
 }  // namespace
@@ -266,8 +327,11 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
                  std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
                  std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
                  std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
-                 std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<const Options> options,
-                 std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors)
+                 std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<BloomCache> block_bloom_cache,
+                 std::shared_ptr<const Options> options, std::atomic<std::uint64_t>* crc_errors,
+                 std::atomic<std::uint64_t>* read_errors, std::vector<std::uint64_t> block_filter_offsets,
+                 std::uint32_t block_filter_bits_per_key, std::uint32_t block_filter_hash_count,
+                 std::uint64_t block_filter_start)
     : path_(std::move(path)),
       path_ref_(std::make_shared<std::string>(path_.string())),
       blocks_(std::move(index)),
@@ -279,22 +343,31 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
       cache_(std::move(cache)),
       raw_cache_(std::move(raw_cache)),
       bloom_cache_(std::move(bloom_cache)),
+      block_bloom_cache_(std::move(block_bloom_cache)),
       options_(std::move(options)),
       crc_error_counter_(crc_errors),
       read_error_counter_(read_errors),
       bloom_bytes_(bloom_bytes),
       bloom_bits_per_key_(bloom_bits_per_key),
+      block_filter_offsets_(std::move(block_filter_offsets)),
+      block_filter_bits_per_key_(block_filter_bits_per_key),
+      block_filter_hash_count_(block_filter_hash_count),
+      block_filter_start_(block_filter_start),
+      has_block_filters_(!block_filter_offsets_.empty() && block_filter_bits_per_key_ > 0 &&
+                         block_filter_hash_count_ > 0),
       pin_bloom_(pin_bloom),
       file_(path_, std::ios::binary) {}
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress) {
-  return WriteImpl(path, entries, block_size, bloom_bits_per_key, enable_compress);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress,
+                     std::size_t block_bloom_bits_per_key) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key, enable_compress, block_bloom_bits_per_key);
 }
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntryView>& entries,
-                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress) {
-  return WriteImpl(path, entries, block_size, bloom_bits_per_key, enable_compress);
+                     std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress,
+                     std::size_t block_bloom_bits_per_key) {
+  return WriteImpl(path, entries, block_size, bloom_bits_per_key, enable_compress, block_bloom_bits_per_key);
 }
 
 std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
@@ -339,9 +412,42 @@ std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
   return data;
 }
 
+std::shared_ptr<BloomCache::Data> SSTable::LoadBlockBloom(std::size_t block_index) const {
+  if (!has_block_filters_ || block_index >= block_filter_offsets_.size()) return nullptr;
+  const auto offset = block_filter_offsets_[block_index];
+  if (offset == 0) return nullptr;
+  const std::string cache_key = *path_ref_ + "#blk#" + std::to_string(block_index);
+  if (block_bloom_cache_) {
+    if (auto cached = block_bloom_cache_->Get(cache_key)) return cached;
+  }
+
+  std::vector<std::uint8_t> bits;
+  {
+    std::lock_guard lk(io_mu_);
+    if (!file_.is_open()) return nullptr;
+    file_.clear();
+    file_.seekg(static_cast<std::streamoff>(offset));
+    std::uint32_t bytes = 0;
+    if (!ReadU32(file_, bytes)) return nullptr;
+    if (bytes == 0 || offset + sizeof(std::uint32_t) + bytes > file_size_) return nullptr;
+    bits.resize(bytes);
+    if (!file_.read(reinterpret_cast<char*>(bits.data()), static_cast<std::streamsize>(bytes))) {
+      return nullptr;
+    }
+  }
+
+  if (block_bloom_cache_) {
+    return block_bloom_cache_->Put(cache_key, std::move(bits), block_filter_bits_per_key_, block_filter_hash_count_);
+  }
+  BloomFilter bloom;
+  bloom.SetData(std::move(bits), block_filter_bits_per_key_, block_filter_hash_count_);
+  return std::make_shared<BloomCache::Data>(BloomCache::Data{std::move(bloom), bloom.bit_size() / 8});
+}
+
 Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<BlockCache>& cache,
                     const std::shared_ptr<RawBlockCache>& raw_cache, const std::shared_ptr<BloomCache>& bloom_cache,
-                    bool pin_bloom, std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
+                    const std::shared_ptr<BloomCache>& block_bloom_cache, bool pin_bloom,
+                    std::shared_ptr<SSTable>& out, std::shared_ptr<const Options> options,
                     std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors) {
   auto size_opt = FileSize(path);
   if (!size_opt)[[unlikely]] return Status::IOError("unable to stat sstable: " + path.string());
@@ -433,11 +539,32 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     return Status::Corruption("bad bloom header: " + path.string());
   }
 
+  std::vector<std::uint64_t> block_filter_offsets;
+  std::uint32_t block_filter_bits_per_key = 0;
+  std::uint32_t block_filter_k = 0;
+  if (footer.has_block_filters) {
+    if (footer.block_filter_start > *size_opt || footer.block_filter_index_start > *size_opt) {
+      return Status::Corruption("block filter offsets out of range: " + path.string());
+    }
+    in.seekg(static_cast<std::streamoff>(footer.block_filter_start));
+    if (!ReadU32(in, block_filter_bits_per_key) || !ReadU32(in, block_filter_k)) {
+      return Status::Corruption("bad block filter header: " + path.string());
+    }
+    block_filter_offsets.resize(footer.block_count, 0);
+    in.seekg(static_cast<std::streamoff>(footer.block_filter_index_start));
+    for (std::uint32_t i = 0; i < footer.block_count; ++i) {
+      if (!ReadU64(in, block_filter_offsets[i])) {
+        return Status::Corruption("bad block filter index: " + path.string());
+      }
+    }
+  }
+
   std::string min_key = index.front().key;
-  auto sstable = std::shared_ptr<SSTable>(new SSTable(path, std::move(index), std::move(min_key), max_key,
-                                                      footer.max_seq, *size_opt, footer.bloom_start, bloom_bytes,
-                                                      bloom_bits, pin_bloom, cache, raw_cache, bloom_cache,
-                                                      std::move(options), crc_errors, read_errors));
+  auto sstable = std::shared_ptr<SSTable>(
+      new SSTable(path, std::move(index), std::move(min_key), max_key, footer.max_seq, *size_opt, footer.bloom_start,
+                  bloom_bytes, bloom_bits, pin_bloom, cache, raw_cache, bloom_cache, block_bloom_cache,
+                  std::move(options), crc_errors, read_errors, std::move(block_filter_offsets),
+                  block_filter_bits_per_key, block_filter_k, footer.block_filter_start));
   if (!sstable->file_.is_open()) return Status::IOError("failed to open sstable reader: " + path.string());
   out = std::move(sstable);
   return Status::OK();
@@ -453,6 +580,12 @@ bool SSTable::Get(std::string_view key, MemEntry& entry) const {
       [](std::string_view k, const BlockIndexEntry& b) { return k < b.key; });
   if (it == blocks_.begin()) return false;
   --it;
+  std::size_t block_index = static_cast<std::size_t>(it - blocks_.begin());
+  if (has_block_filters_) {
+    if (auto block_filter = LoadBlockBloom(block_index)) {
+      if (!block_filter->bloom.MayContain(key)) return false;
+    }
+  }
   std::uint64_t start = it->offset;
   std::uint64_t size = it->size;
   return ReadEntryRange(start, start + size, key, entry);

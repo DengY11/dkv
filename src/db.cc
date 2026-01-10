@@ -121,6 +121,7 @@ class DB::Impl {
   std::shared_ptr<BlockCache> block_cache_;
   std::shared_ptr<RawBlockCache> raw_block_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
+  std::shared_ptr<BloomCache> block_bloom_cache_;
   std::atomic<std::uint64_t> sstable_crc_errors_{0};
   std::atomic<std::uint64_t> sstable_read_errors_{0};
   std::mutex manifest_mu_;
@@ -202,8 +203,11 @@ Status DB::Impl::Init() {
   if (options_.raw_block_cache_capacity_bytes > 0) {
     raw_block_cache_ = std::make_shared<RawBlockCache>(options_.raw_block_cache_capacity_bytes);
   }
-  if (options_.bloom_cache_capacity_bytes > 0) {
-    bloom_cache_ = std::make_shared<BloomCache>(options_.bloom_cache_capacity_bytes);
+  if (options_.table_bloom_cache_capacity_bytes > 0) {
+    bloom_cache_ = std::make_shared<BloomCache>(options_.table_bloom_cache_capacity_bytes);
+  }
+  if (options_.block_bloom_cache_capacity_bytes > 0) {
+    block_bloom_cache_ = std::make_shared<BloomCache>(options_.block_bloom_cache_capacity_bytes);
   }
 
   s = LoadSSTables();
@@ -339,8 +343,8 @@ Status DB::Impl::LoadSSTables() {
       if (!parse_level(entry.path().filename().string(), level)) continue;
       std::shared_ptr<SSTable> table;
       bool pin_bloom = level > 0;
-      Status s = SSTable::Open(entry.path(), block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, table,
-                               options_ptr_, &sstable_crc_errors_, &sstable_read_errors_);
+      Status s = SSTable::Open(entry.path(), block_cache_, raw_block_cache_, bloom_cache_, block_bloom_cache_,
+                               pin_bloom, table, options_ptr_, &sstable_crc_errors_, &sstable_read_errors_);
       if (!s.ok()) return s;
       ensure_level(level);
       loaded[level].push_back(TableRef{table, table->min_key(), table->max_key(), table->file_size()});
@@ -401,19 +405,11 @@ Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
   s = mem_->Delete(seq, key);
   if (!s.ok()) return s;
   if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
-  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
   shared.unlock();
-  if (need_rotate) {
-    std::unique_lock lk(mu_);
-    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-      auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
-      std::filesystem::path rotated;
-      s = RotateWalLocked(seq, rotated);
-      if (!s.ok()) return s;
-      EnqueueImmutable(std::move(imm_mem), seq, rotated);
-    }
-  }
+  /*delete don't need to call ApproximateMemoryUsage() to decide if need to rotate memtable
+    as delete won't add any memory use in memtable. so i removed the rotate details here.
+  */
+  
   return Status::OK();
 }
 
@@ -745,8 +741,8 @@ Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
     auto path = data_dir_ / path_str;
     std::shared_ptr<SSTable> table;
     bool pin_bloom = level > 0;
-    Status s = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, table, options_ptr_,
-                              &sstable_crc_errors_, &sstable_read_errors_);
+    Status s = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, block_bloom_cache_, pin_bloom, table,
+                             options_ptr_, &sstable_crc_errors_, &sstable_read_errors_);
     if (!s.ok()) return s;
     ensure_level(level);
     loaded[level].push_back(TableRef{table, min_key, max_key, size == 0 ? table->file_size() : size});
@@ -911,13 +907,13 @@ Status DB::Impl::FlushImmutable(const std::shared_ptr<ImmutableMem>& imm) {
     const auto filename = "sst-l0-" + std::to_string(NextFileId()) + ".sst";
     const auto path = sst_dir_ / filename;
 
-    Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes, options_.bloom_bits_per_key,
-                               options_.enable_compress);
+    Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes, options_.table_bloom_bits_per_key,
+                               options_.enable_compress, options_.block_bloom_bits_per_key);
     if (!ws.ok()) return ws;
 
     std::shared_ptr<SSTable> table;
-    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, false, table, options_ptr_,
-                       &sstable_crc_errors_, &sstable_read_errors_);
+    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, block_bloom_cache_, false, table,
+                       options_ptr_, &sstable_crc_errors_, &sstable_read_errors_);
     if (!ws.ok()) return ws;
 
     new_tables.push_back(TableRef{table, table->min_key(), table->max_key(), table->file_size()});
@@ -1186,13 +1182,13 @@ Status DB::Impl::CompactLevel(std::size_t level) {
     if (data.empty()) return Status::OK();
     const auto filename = "sst-l" + std::to_string(level + 1) + "-" + std::to_string(NextFileId()) + ".sst";
     const auto path = sst_dir_ / filename;
-    Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes,
-                               options_.bloom_bits_per_key, options_.enable_compress);
+    Status ws = SSTable::Write(path, data, options_.sstable_block_size_bytes, options_.table_bloom_bits_per_key,
+                               options_.enable_compress, options_.block_bloom_bits_per_key);
     if (!ws.ok()) return ws;
     std::shared_ptr<SSTable> t;
     bool pin_bloom = (level + 1) > 0;
-    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, pin_bloom, t, options_ptr_,
-                       &sstable_crc_errors_, &sstable_read_errors_);
+    ws = SSTable::Open(path, block_cache_, raw_block_cache_, bloom_cache_, block_bloom_cache_, pin_bloom, t,
+                       options_ptr_, &sstable_crc_errors_, &sstable_read_errors_);
     if (!ws.ok()) return ws;
     outputs.push_back(TableRef{t, t->min_key(), t->max_key(), t->file_size()});
     data.clear();
