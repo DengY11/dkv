@@ -34,6 +34,20 @@ class SSTable {
   Status LoadAll(std::vector<MemEntry>& out) const;
   Status Scan(std::string_view from, std::size_t limit,
               std::vector<std::pair<std::string, std::string>>& out) const;
+  class Iterator {
+   public:
+    bool Next(MemEntry& out);
+
+   private:
+    friend class SSTable;
+    Iterator(const SSTable* t, std::size_t block_idx, std::size_t entry_idx)
+        : table_(t), block_idx_(block_idx), entry_idx_(entry_idx) {}
+    const SSTable* table_{nullptr};
+    std::size_t block_idx_{0};
+    std::size_t entry_idx_{0};
+    std::shared_ptr<const std::vector<MemEntry>> block_;
+  };
+  Iterator NewIterator() const;
 
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
   [[nodiscard]] std::uint64_t max_sequence() const { return max_seq_; }

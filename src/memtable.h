@@ -48,6 +48,21 @@ class MemTable {
   [[nodiscard]] std::size_t ApproximateMemoryUsage() const;
   [[nodiscard]] bool Empty() const;
 
+  class Iterator {
+   public:
+    bool Valid() const;
+    void Next();
+    MemEntryView view() const;
+
+   private:
+    friend class MemTable;
+    explicit Iterator(const void* node) : node_(node) {}
+    const void* node_{nullptr};
+  };
+
+  // Returns an iterator positioned at the first entry (if any).
+  Iterator NewIterator() const;
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

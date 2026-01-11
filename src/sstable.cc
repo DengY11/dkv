@@ -458,6 +458,23 @@ bool SSTable::Get(std::string_view key, MemEntry& entry) const {
   return ReadEntryRange(start, start + size, key, entry);
 }
 
+SSTable::Iterator SSTable::NewIterator() const { return Iterator(this, 0, 0); }
+
+bool SSTable::Iterator::Next(MemEntry& out) {
+  while (true) {
+    if (!block_ || entry_idx_ >= block_->size()) {
+      if (!table_ || block_idx_ >= table_->blocks_.size()) return false;
+      const auto& b = table_->blocks_[block_idx_++];
+      if (!table_->ReadBlock(b.offset, b.size, block_)) return false;
+      entry_idx_ = 0;
+      continue;
+    }
+    const auto& e = (*block_)[entry_idx_++];
+    out = e;
+    return true;
+  }
+}
+
 Status SSTable::LoadAll(std::vector<MemEntry>& out) const {
   for (const auto& b : blocks_) {
     std::shared_ptr<const std::vector<MemEntry>> raw_block;

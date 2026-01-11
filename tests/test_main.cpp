@@ -255,6 +255,66 @@ bool TestSnapshotIsolationAndLargeScan() {
   return true;
 }
 
+bool TestStreamingScanAcrossSources() {
+  auto dir = TempDir("dkv-stream-scan");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 64;  // small to force flush
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db stream scan")) return false;
+  auto cleanup = [&]() {
+    db.reset();
+    std::filesystem::remove_all(dir);
+  };
+
+  dkv::WriteOptions wopts;
+  // First SSTable.
+  if (!ExpectOk(db->Put(wopts, "a1", "v1"), "put a1")) return false;
+  if (!ExpectOk(db->Put(wopts, "a2", "v2"), "put a2")) return false;
+  if (!ExpectOk(db->Flush(), "flush1")) {
+    cleanup();
+    return false;
+  }
+
+  // Second SSTable (updates + tombstone).
+  if (!ExpectOk(db->Put(wopts, "a1", "v1b"), "put a1b")) {
+    cleanup();
+    return false;
+  }
+  if (!ExpectOk(db->Delete(wopts, "a2"), "del a2")) {
+    cleanup();
+    return false;
+  }
+  if (!ExpectOk(db->Put(wopts, "a3", "v3"), "put a3")) {
+    cleanup();
+    return false;
+  }
+  if (!ExpectOk(db->Flush(), "flush2")) {
+    cleanup();
+    return false;
+  }
+
+  // Active memtable entry.
+  if (!ExpectOk(db->Put(wopts, "a0", "v0"), "put a0")) {
+    cleanup();
+    return false;
+  }
+
+  auto it = db->Scan(dkv::ReadOptions{}, "a");
+  std::vector<std::pair<std::string, std::string>> out;
+  for (it->SeekToFirst(); it->Valid(); it->Next()) {
+    out.emplace_back(std::string(it->key()), std::string(it->value()));
+  }
+  cleanup();
+
+  if (out.size() != 3 || out[0].first != "a0" || out[0].second != "v0" || out[1].first != "a1" ||
+      out[1].second != "v1b" || out[2].first != "a3" || out[2].second != "v3") {
+    std::cerr << "stream scan unexpected results\n";
+    return false;
+  }
+  return true;
+}
+
 bool TestCompressionOption() {
   auto dir = TempDir("dkv-compress");
   dkv::Options opts;
@@ -625,6 +685,7 @@ int main() {
   ok &= TestCompaction();
   ok &= TestIteratorAndSnapshot();
   ok &= TestSnapshotIsolationAndLargeScan();
+  ok &= TestStreamingScanAcrossSources();
   ok &= TestCompressionOption();
   ok &= TestSSTableCrcStats();
   ok &= TestBatchWrite();

@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <functional>
 #include <shared_mutex>
 #include <set>
 #include <sstream>
@@ -21,6 +22,7 @@
 #include <atomic>
 #include <algorithm>
 #include <deque>
+#include <queue>
 #include "block_cache.h"
 #include "bloom_cache.h"
 #include "memtable.h"
@@ -87,7 +89,8 @@ class DB::Impl {
   void CompactThreadLoop();
   void EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
   Status FlushImmutable(const std::shared_ptr<ImmutableMem>& imm);
-  Status BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq);
+  Status BuildMergedView(std::vector<std::pair<std::string, std::string>>& out, std::string_view prefix,
+                         std::uint64_t snapshot_seq);
   std::uint64_t SnapshotSeq(const ReadOptions& options) const;
   std::uint64_t RegisterSnapshot(std::uint64_t seq);
   void UnregisterSnapshot(std::uint64_t seq);
@@ -522,48 +525,121 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
   return Status::NotFound("missing");
 }
 
-Status DB::Impl::BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq) {
-  std::vector<MemEntry> mem_entries;
-  std::vector<std::shared_ptr<ImmutableMem>> imm_copy;
+Status DB::Impl::BuildMergedView(std::vector<std::pair<std::string, std::string>>& out, std::string_view prefix,
+                                 std::uint64_t snapshot_seq) {
+  struct Cursor {
+    std::function<bool(MemEntry&)> next;
+  };
+
+  std::vector<Cursor> cursors;
+  // Active memtable and immutables: iterate directly over skip list nodes.
   {
     std::shared_lock mu_lk(mu_);
-    mem_entries = mem_->Snapshot();
-    std::lock_guard lk(flush_mu_);
-    imm_copy.assign(immutables_.begin(), immutables_.end());
-  }
-  for (auto& e : mem_entries) {
-    if (e.seq > snapshot_seq) continue;
-    auto it = merged.find(e.key);
-    if (it == merged.end() || it->second.seq < e.seq) {
-      merged[e.key] = std::move(e);
-    }
-  }
-
-  for (const auto& imm : imm_copy) {
-    if (!imm || !imm->mem) continue;
-    auto imm_entries = imm->mem->Snapshot();
-    for (auto& e : imm_entries) {
-      if (e.seq > snapshot_seq) continue;
-      auto it = merged.find(e.key);
-      if (it == merged.end() || it->second.seq < e.seq) {
-        merged[e.key] = std::move(e);
-      }
-    }
-  }
-
-  std::shared_lock lock(sstable_mu_);
-  for (const auto& level : levels_) {
-    for (const auto& tref : level) {
-      std::vector<MemEntry> entries;
-      Status s = tref.table->LoadAll(entries);
-      if (!s.ok()) return s;
-      for (auto& e : entries) {
-        if (e.seq > snapshot_seq) continue;
-        auto it = merged.find(e.key);
-        if (it == merged.end() || it->second.seq < e.seq) {
-          merged[e.key] = std::move(e);
+    {
+      auto it = mem_->NewIterator();
+      cursors.push_back(Cursor{[cur = it, snapshot_seq](MemEntry& out) mutable {
+        while (cur.Valid()) {
+          auto v = cur.view();
+          cur.Next();
+          if (v.seq > snapshot_seq) continue;
+          out.key = std::string(v.key);
+          out.value = std::string(v.value);
+          out.seq = v.seq;
+          out.deleted = v.deleted;
+          return true;
         }
+        return false;
+      }});
+    }
+    std::lock_guard lk(flush_mu_);
+    for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+      if (!(*it) || !(*it)->mem) continue;
+      auto iter = (*it)->mem->NewIterator();
+      cursors.push_back(Cursor{[cur = iter, snapshot_seq](MemEntry& out) mutable {
+        while (cur.Valid()) {
+          auto v = cur.view();
+          cur.Next();
+          if (v.seq > snapshot_seq) continue;
+          out.key = std::string(v.key);
+          out.value = std::string(v.value);
+          out.seq = v.seq;
+          out.deleted = v.deleted;
+          return true;
+        }
+        return false;
+      }});
+    }
+  }
+
+  // SSTables: build iterators without loading full contents.
+  std::vector<std::shared_ptr<SSTable>> tables;
+  {
+    std::shared_lock lk(sstable_mu_);
+    for (const auto& level : levels_) {
+      for (const auto& tref : level) tables.push_back(tref.table);
+    }
+  }
+  for (auto& t : tables) {
+    cursors.push_back(Cursor{[cur_it = t->NewIterator(), snapshot_seq](MemEntry& out) mutable {
+      MemEntry tmp;
+      while (cur_it.Next(tmp)) {
+        if (tmp.seq > snapshot_seq) continue;
+        out = std::move(tmp);
+        return true;
       }
+      return false;
+    }});
+  }
+
+  struct Item {
+    std::string key;
+    MemEntry entry;
+    std::size_t cursor_idx{0};
+  };
+  auto cmp = [](const Item& a, const Item& b) { return a.key > b.key; };
+  std::priority_queue<Item, std::vector<Item>, decltype(cmp)> heap(cmp);
+
+  auto advance_and_push = [&](std::size_t i, std::string_view skip_key) {
+    MemEntry e;
+    while (cursors[i].next && cursors[i].next(e)) {
+      if (!skip_key.empty() && e.key == skip_key) continue;
+      heap.push(Item{e.key, std::move(e), i});
+      return;
+    }
+  };
+
+  for (std::size_t i = 0; i < cursors.size(); ++i) {
+    advance_and_push(i, "");
+  }
+
+  while (!heap.empty()) {
+    const std::string current_key = heap.top().key;
+    std::uint64_t best_seq = 0;
+    bool best_deleted = false;
+    std::string best_value;
+
+    std::vector<Item> same_key;
+    while (!heap.empty() && heap.top().key == current_key) {
+      same_key.push_back(std::move(heap.top()));
+      heap.pop();
+    }
+
+    for (const auto& it : same_key) {
+      if (it.entry.seq > best_seq) {
+        best_seq = it.entry.seq;
+        best_deleted = it.entry.deleted;
+        best_value = it.entry.value;
+      }
+    }
+
+    if (!best_deleted) {
+      if (prefix.empty() || current_key.rfind(prefix, 0) == 0) {
+        out.emplace_back(current_key, std::move(best_value));
+      }
+    }
+
+    for (const auto& it : same_key) {
+      advance_and_push(it.cursor_idx, current_key);
     }
   }
   return Status::OK();
@@ -598,8 +674,8 @@ std::uint64_t DB::Impl::MinActiveSnapshot() const {
 
 std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& options, std::string_view prefix) {
   std::uint64_t snap = SnapshotSeq(options);
-  std::map<std::string, MemEntry> merged;
-  Status s = BuildMergedView(merged, snap);
+  std::vector<std::pair<std::string, std::string>> merged;
+  Status s = BuildMergedView(merged, prefix, snap);
   auto rep = std::make_unique<DB::Iterator::Rep>();
   rep->prefix.assign(prefix);
   rep->snapshot_seq = snap;
@@ -608,12 +684,7 @@ std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& options, 
     return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
   }
 
-  rep->data.reserve(merged.size());
-  for (auto& kv : merged) {
-    if (kv.second.deleted) continue;
-    if (!rep->prefix.empty() && kv.first.rfind(rep->prefix, 0) != 0) continue;
-    rep->data.emplace_back(std::move(kv.first), std::move(kv.second.value));
-  }
+  rep->data = std::move(merged);
   rep->pos = rep->data.empty() ? rep->data.size() : 0;  // pos==size means invalid; use 0 if non-empty
   if (options.snapshot || options.snapshot_seq != 0) {
     rep->registered = true;

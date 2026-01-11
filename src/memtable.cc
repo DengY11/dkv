@@ -31,6 +31,28 @@ struct Node {
       new (&next[i]) std::atomic<Node*>{nullptr};
     }
   }
+
+  Node* Next(int n) {
+    assert(n >= 0);
+    return next[n].load(std::memory_order_acquire);
+  }
+  Node* Next(int n) const {
+    assert(n >= 0);
+    return next[n].load(std::memory_order_acquire);
+  }
+  void SetNext(int n, Node* x) {
+    assert(n >= 0);
+    next[n].store(x, std::memory_order_release);
+  }
+  Node* NoBarrier_Next(int n) {
+    assert(n >= 0);
+    return next[n].load(std::memory_order_relaxed);
+  }
+  void NoBarrier_SetNext(int n, Node* x) {
+    assert(n >= 0);
+    next[n].store(x, std::memory_order_relaxed);
+  }
+  int height_levels() const { return height; }
 };
 
 class Arena {
@@ -151,38 +173,9 @@ class SkipList {
 
   bool Empty() const { return head_->Next(0) == nullptr; }
 
+  Node* HeadNext() const { return head_->Next(0); }
+
  private:
-  struct Node {
-    std::string_view key;
-    std::string_view value;
-    std::uint64_t seq{0};
-    bool deleted{false};
-    explicit Node(int height) : height_(height) {}
-
-    Node* Next(int n) {
-      assert(n >= 0);
-      return next_[n].load(std::memory_order_acquire);
-    }
-    void SetNext(int n, Node* x) {
-      assert(n >= 0);
-      next_[n].store(x, std::memory_order_release);
-    }
-    Node* NoBarrier_Next(int n) {
-      assert(n >= 0);
-      return next_[n].load(std::memory_order_relaxed);
-    }
-    void NoBarrier_SetNext(int n, Node* x) {
-      assert(n >= 0);
-      next_[n].store(x, std::memory_order_relaxed);
-    }
-
-    int height() const { return height_; }
-
-   private:
-    int height_;
-    std::atomic<Node*> next_[1];
-  };
-
   Node* NewNode(std::string_view key, std::string_view value, std::uint64_t seq, bool deleted, int height) {
     char* mem =
         static_cast<char*>(arena_->AllocateAligned(sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1), alignof(Node)));
@@ -302,5 +295,19 @@ void MemTable::Clear() {
 std::size_t MemTable::ApproximateMemoryUsage() const { return impl_->arena->Used(); }
 
 bool MemTable::Empty() const { return impl_->list->Empty(); }
+
+MemTable::Iterator MemTable::NewIterator() const { return Iterator(impl_->list->HeadNext()); }
+
+bool MemTable::Iterator::Valid() const { return node_ != nullptr; }
+
+void MemTable::Iterator::Next() {
+  if (!node_) return;
+  node_ = static_cast<const Node*>(node_)->Next(0);
+}
+
+MemEntryView MemTable::Iterator::view() const {
+  const Node* n = static_cast<const Node*>(node_);
+  return MemEntryView{n->key, n->value, n->seq, n->deleted};
+}
 
 }  // namespace dkv
