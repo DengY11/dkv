@@ -42,8 +42,6 @@ struct Options {
   // Verify SSTable block payload with CRC32 on read (adds ~4B per block). When false, CRC is still stored
   // but skipped at read time to save CPU.
   bool verify_sstable_crc{false};
-  // Number of shards in memtable for concurrency (power of two recommended).
-  std::size_t memtable_shard_count{16};
   bool enable_compress{false};
 };
 

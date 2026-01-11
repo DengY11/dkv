@@ -27,6 +27,7 @@
 #include "sstable.h"
 #include "wal.h"
 #include "util.h"
+#include "dkv/filename.h"
 
 namespace dkv {
 
@@ -46,9 +47,9 @@ class DB::Impl {
       : options_(std::move(options)),
         options_ptr_(std::make_shared<const Options>(options_)),
         data_dir_(options_.data_dir),
-        wal_path_(data_dir_ / "wal.log"),
+        wal_path_(data_dir_ / std::string(kWalActiveName)),
         sst_dir_(data_dir_ / "sst"),
-        mem_(std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes)) {}
+        mem_(std::make_unique<MemTable>(options_.memtable_soft_limit_bytes)) {}
   ~Impl();
 
   Status Init();
@@ -150,7 +151,9 @@ class DB::Impl {
   mutable std::mutex compact_status_mu_;
   Status last_compact_status_{Status::OK()};
 
-  std::shared_mutex mu_;  // shared for reads/writes; unique for flush/compaction/wal rotation.
+  // Guards global DB state (seq allocation, WAL rotation, immutable queue, version metadata).
+  // Shared for normal reads/writes; upgraded to unique for rotate/flush/compaction that mutate state.
+  std::shared_mutex mu_;
   std::atomic<std::uint64_t> next_seq_{1};
 
   std::thread wal_sync_thread_;
@@ -214,13 +217,17 @@ Status DB::Impl::Init() {
   for (const auto& entry : std::filesystem::directory_iterator(data_dir_)) {
     if (!entry.is_regular_file()) continue;
     const auto name = entry.path().filename().string();
-    if (name.rfind("wal-", 0) == 0 && entry.path().extension() == ".log") {
-      auto num_str = name.substr(4, name.size() - 4 - 4);  // strip wal- and .log
-      try {
-        auto seq = static_cast<std::uint64_t>(std::stoull(num_str));
-        wal_segments.emplace_back(seq, entry.path());
-      } catch (...) {
-        continue;
+    if (name.rfind(kWalPrefix, 0) == 0 && entry.path().extension() == kWalExtension) {
+      const std::size_t prefix_len = kWalPrefix.size();
+      const std::size_t ext_len = kWalExtension.size();
+      if (name.size() > prefix_len + ext_len) {
+        auto num_str = name.substr(prefix_len, name.size() - prefix_len - ext_len);
+        try {
+          auto seq = static_cast<std::uint64_t>(std::stoull(num_str));
+          wal_segments.emplace_back(seq, entry.path());
+        } catch (...) {
+          continue;
+        }
       }
     }
   }
@@ -300,7 +307,7 @@ Status DB::Impl::LoadSSTables() {
   std::vector<std::vector<TableRef>> loaded;
   bool manifest_loaded = false;
   // Try manifest first.
-  if (std::filesystem::exists(data_dir_ / "MANIFEST")) {
+  if (std::filesystem::exists(data_dir_ / std::string(kManifestName))) {
     Status ms = LoadManifest(loaded);
     if (!ms.ok()) return ms;
     manifest_loaded = !loaded.empty();
@@ -381,7 +388,7 @@ Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string v
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
@@ -407,7 +414,7 @@ Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
@@ -457,7 +464,7 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       Status s = RotateWalLocked(seqs.back(), rotated);
       if (!s.ok()) return s;
@@ -632,7 +639,7 @@ Status DB::Impl::FlushLocked() {
   if (mem_->Empty() && immutables_.empty()) return Status::OK();
   if (!mem_->Empty()) {
     auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+    mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
     std::filesystem::path rotated;
     auto cur = next_seq_.load(std::memory_order_relaxed);
     std::uint64_t max_seq = cur ? cur - 1 : 0;
@@ -658,9 +665,9 @@ Status DB::Impl::WriteManifest() {
     }
   }
 
-  const auto manifest_tmp =
-      data_dir_ / ("MANIFEST.tmp." + std::to_string(manifest_tmp_seq_.fetch_add(1, std::memory_order_relaxed)));
-  const auto manifest = data_dir_ / "MANIFEST";
+    const auto manifest_tmp = data_dir_ / (std::string(kManifestTmpPrefix) +
+                                           std::to_string(manifest_tmp_seq_.fetch_add(1, std::memory_order_relaxed)));
+  const auto manifest = data_dir_ / std::string(kManifestName);
   {
     std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return Status::IOError("open MANIFEST.tmp failed");
@@ -685,7 +692,7 @@ Status DB::Impl::WriteManifest() {
 }
 
 Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
-  const auto manifest = data_dir_ / "MANIFEST";
+  const auto manifest = data_dir_ / std::string(kManifestName);
   std::ifstream in(manifest);
   if (!in.is_open()) return Status::IOError("failed to open MANIFEST");
   std::string header;
@@ -862,7 +869,8 @@ Status DB::Impl::RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem:
   // Assume mu_ is held.
   std::lock_guard guard(wal_sync_mu_);
   wal_->Close();
-  rotated_path = data_dir_ / ("wal-" + std::to_string(max_seq_for_old) + ".log");
+      rotated_path =
+          data_dir_ / (std::string(kWalPrefix) + std::to_string(max_seq_for_old) + std::string(kWalExtension));
   std::error_code ec;
   std::filesystem::rename(wal_path_, rotated_path, ec);
   if (ec) return Status::IOError("failed to rotate wal: " + ec.message());

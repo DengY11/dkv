@@ -1,15 +1,13 @@
 #pragma once
 
+#pragma once
+
+#include <atomic>
 #include <cstddef>
-#include <array>
-#include <functional>
-#include <map>
+#include <cstdint>
 #include <memory>
-#include <memory_resource>
-#include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 #include "dkv/status.h"
@@ -19,8 +17,8 @@ namespace dkv {
 struct MemEntry {
   std::string key;
   std::string value;
- std::uint64_t seq{0};
- bool deleted{false};
+  std::uint64_t seq{0};
+  bool deleted{false};
 };
 
 struct MemEntryView {
@@ -30,10 +28,15 @@ struct MemEntryView {
   bool deleted{false};
 };
 
+// Lock-free (append-only) memtable using skip list and arena-backed storage.
+// Nodes are never reclaimed until Clear()/destruction, making concurrent reads lock-free.
 class MemTable {
  public:
-  explicit MemTable(std::size_t shard_count = 16, std::size_t approx_capacity_bytes = 0);
+  explicit MemTable(std::size_t approx_capacity_bytes = 0);
   ~MemTable();
+  MemTable(const MemTable&) = delete;
+  MemTable& operator=(const MemTable&) = delete;
+
   Status Put(std::uint64_t seq, std::string_view key, std::string_view value);
   Status Delete(std::uint64_t seq, std::string_view key);
   bool Get(std::string_view key, MemEntry& entry) const;
@@ -46,20 +49,8 @@ class MemTable {
   [[nodiscard]] bool Empty() const;
 
  private:
-  struct MemValue {
-    // dont use MemEntry here because key is unnecessary
-    std::pmr::string value;
-    std::uint64_t seq{0};
-    bool deleted{false};
-  };
-
-  struct Shard;
-  std::vector<std::unique_ptr<Shard>> shards_;
-  std::size_t shard_count_{16};
-  std::size_t shard_mask_{15};
-  std::size_t base_usage_{0};
-
-  [[nodiscard]] std::size_t RawMemoryUsage() const;
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace dkv
