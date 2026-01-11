@@ -146,7 +146,8 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
   }
 
   struct LocalIdx {
-    std::string key;
+    std::string min_key;
+    std::string max_key;
     std::uint64_t offset{0};
     std::uint32_t size{0};
   };
@@ -158,6 +159,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
 
   std::uint64_t current_block_bytes = 0;
   std::string block_first_key(entries.front().key);
+  std::string block_last_key(entries.front().key);
   std::uint64_t block_start = static_cast<std::uint64_t>(out.tellp());
   std::string block_buf;
   block_buf.reserve(block_size * 2);
@@ -191,7 +193,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
     if (!out) return Status::IOError("failed to write block");
     std::uint64_t end = static_cast<std::uint64_t>(out.tellp());
-    blocks.push_back(LocalIdx{block_first_key, block_start,
+    blocks.push_back(LocalIdx{block_first_key, block_last_key, block_start,
                               static_cast<std::uint32_t>(end - block_start)});
     block_buf.clear();
     current_block_bytes = 0;
@@ -204,6 +206,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
     const std::string_view key_view = e.key;
     const std::string_view value_view = e.value;
     bloom_keys.push_back(key_view);
+    block_last_key.assign(e.key);
     max_seq = std::max(max_seq, e.seq);
 
     const auto before = block_buf.size();
@@ -219,6 +222,7 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
       Status fs = flush_block();
       if (!fs.ok()) return fs;
       block_first_key.assign(entries[i + 1].key);
+      block_last_key.assign(entries[i + 1].key);
     }
   }
   Status fs = flush_block();
@@ -233,8 +237,10 @@ Status WriteImpl(const std::filesystem::path& path, const std::vector<Entry>& en
 
   const auto index_start = static_cast<std::uint64_t>(out.tellp());
   for (const auto& idx : blocks) {
-    WriteU32(out, static_cast<std::uint32_t>(idx.key.size()));
-    out.write(idx.key.data(), static_cast<std::streamsize>(idx.key.size()));
+    WriteU32(out, static_cast<std::uint32_t>(idx.min_key.size()));
+    out.write(idx.min_key.data(), static_cast<std::streamsize>(idx.min_key.size()));
+    WriteU32(out, static_cast<std::uint32_t>(idx.max_key.size()));
+    out.write(idx.max_key.data(), static_cast<std::streamsize>(idx.max_key.size()));
     WriteU64(out, idx.offset);
     WriteU32(out, idx.size);
   }
@@ -361,69 +367,29 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
   std::vector<BlockIndexEntry> index;
   index.reserve(footer.block_count);
   for (std::uint32_t i = 0; i < footer.block_count; ++i) {
-    std::uint32_t key_size = 0;
+    std::uint32_t min_size = 0;
+    std::uint32_t max_size = 0;
     std::uint64_t offset = 0;
     std::uint32_t size = 0;
-    if (!ReadU32(in, key_size)) return Status::Corruption("bad index in sstable: " + path.string());
-    std::string key(key_size, '\0');
-    if (!in.read(key.data(), static_cast<std::streamsize>(key_size))) {
-      return Status::Corruption("bad index key in sstable: " + path.string());
+    if (!ReadU32(in, min_size)) return Status::Corruption("bad index in sstable: " + path.string());
+    std::string min_key(min_size, '\0');
+    if (!in.read(min_key.data(), static_cast<std::streamsize>(min_size))) {
+      return Status::Corruption("bad index min key in sstable: " + path.string());
+    }
+    if (!ReadU32(in, max_size)) return Status::Corruption("bad index max size: " + path.string());
+    std::string max_key(max_size, '\0');
+    if (!in.read(max_key.data(), static_cast<std::streamsize>(max_size))) {
+      return Status::Corruption("bad index max key in sstable: " + path.string());
     }
     if (!ReadU64(in, offset) || !ReadU32(in, size)) {
       return Status::Corruption("bad index offset/size in sstable: " + path.string());
     }
-    index.push_back(BlockIndexEntry{std::move(key), offset, size});
+    index.push_back(BlockIndexEntry{std::move(min_key), std::move(max_key), offset, size});
   }
 
   if (index.empty())[[unlikely]] return Status::Corruption("empty index in sstable: " + path.string());
 
-  // Derive max_key by reading the last block's last entry.
-  in.seekg(static_cast<std::streamoff>(index.back().offset));
-  BlockHeader hdr;
-  if (!ReadU32(in, hdr.raw_size) || !ReadU32(in, hdr.stored_size) || !ReadU8(in, hdr.compression) ||
-      !ReadU32(in, hdr.crc)) {
-    return Status::Corruption("failed to read block header: " + path.string());
-  }
-  if (index.back().size <
-      sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + sizeof(hdr.crc) + hdr.stored_size) {
-    return Status::Corruption("block size too small: " + path.string());
-  }
-  std::string payload(hdr.stored_size, '\0');
-  if (!in.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) {
-    return Status::Corruption("failed to read block payload: " + path.string());
-  }
-  std::string raw;
-  std::string_view data_view;
-  if (hdr.compression != 0) {
-    if (!DecompressData(hdr.compression, payload, raw, hdr.raw_size)) {
-      return Status::Corruption("failed to uncompress block");
-    }
-    data_view = raw;
-  } else {
-    data_view = payload;
-  }
-  if (data_view.size() != hdr.raw_size) {
-    return Status::Corruption("block raw size mismatch: " + path.string());
-  }
-  std::string max_key;
-  std::size_t offset = 0;
-  while (offset < data_view.size()) {
-    if (offset + 1 + 8 + 4 + 4 > data_view.size()) break;
-    offset += 1 + 8;  // type + seq
-    auto read32 = [&](std::size_t pos) -> std::uint32_t {
-      return static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos])) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 1])) << 8) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 2])) << 16) |
-             (static_cast<std::uint32_t>(static_cast<unsigned char>(data_view[pos + 3])) << 24);
-    };
-    const std::uint32_t key_size = read32(offset);
-    offset += 4;
-    const std::uint32_t value_size = read32(offset);
-    offset += 4;
-    if (offset + key_size + value_size > data_view.size()) break;
-    max_key.assign(data_view.substr(offset, key_size));
-    offset += key_size + value_size;
-  }
+  std::string max_key = index.back().max_key;
 
   // Minimal bloom info (lazy load on demand)
   in.seekg(static_cast<std::streamoff>(footer.bloom_start));
@@ -433,7 +399,7 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     return Status::Corruption("bad bloom header: " + path.string());
   }
 
-  std::string min_key = index.front().key;
+  std::string min_key = index.front().min_key;
   auto sstable = std::shared_ptr<SSTable>(new SSTable(path, std::move(index), std::move(min_key), max_key,
                                                       footer.max_seq, *size_opt, footer.bloom_start, bloom_bytes,
                                                       bloom_bits, pin_bloom, cache, raw_cache, bloom_cache,
@@ -450,9 +416,10 @@ bool SSTable::Get(std::string_view key, MemEntry& entry) const {
   // Find block whose first key is <= target.
   auto it = std::upper_bound(
       blocks_.begin(), blocks_.end(), key,
-      [](std::string_view k, const BlockIndexEntry& b) { return k < b.key; });
+      [](std::string_view k, const BlockIndexEntry& b) { return k < b.min_key; });
   if (it == blocks_.begin()) return false;
   --it;
+  if (key < it->min_key || key > it->max_key) return false;
   std::uint64_t start = it->offset;
   std::uint64_t size = it->size;
   return ReadEntryRange(start, start + size, key, entry);
@@ -485,7 +452,7 @@ Status SSTable::Scan(std::string_view from, std::size_t limit,
   if (limit == 0) return Status::OK();
   auto it = std::upper_bound(
       blocks_.begin(), blocks_.end(), from,
-      [](std::string_view key, const BlockIndexEntry& e) { return key < e.key; });
+      [](std::string_view key, const BlockIndexEntry& e) { return key < e.min_key; });
   if (it != blocks_.begin()) --it;
   std::size_t added = 0;
   for (; it != blocks_.end() && added < limit; ++it) {
