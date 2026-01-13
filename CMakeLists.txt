@@ -18,7 +18,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-file(GLOB_RECURSE DKV_SOURCES CONFIGURE_DEPENDS src/*.cc)
+set(DKV_SOURCES
+  src/block_cache.cc
+  src/bloom_cache.cc
+  src/bloom.cc
+  src/db.cc
+  src/memtable.cc
+  src/random_access_file.cc
+  src/sstable.cc
+  src/status.cc
+  src/util.cc
+  src/wal.cc)
 
 add_library(dkv STATIC ${DKV_SOURCES})
 target_include_directories(dkv
@@ -124,6 +134,8 @@ if(DKV_BUILD_BENCHMARKS)
   endif()
   add_executable(dkv_bench_put_only benchmarks/bench_put_only.cpp)
   target_link_libraries(dkv_bench_put_only PRIVATE dkv)
+  add_executable(dkv_bench_rand_get benchmarks/bench_rand_get.cpp)
+  target_link_libraries(dkv_bench_rand_get PRIVATE dkv)
   if(SQLite3_FOUND)
     target_link_libraries(dkv_bench PRIVATE SQLite::SQLite3)
     target_compile_definitions(dkv_bench PRIVATE DKV_HAVE_SQLITE=1)

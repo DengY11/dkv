@@ -3,7 +3,6 @@
 DKV exposes tuning knobs through `dkv::Options` (compile-time compression backend is set via `DKV_COMPRESSION` in CMake; runtime just toggles `enable_compress`).
 
 - `memtable_soft_limit_bytes` – Larger → fewer flushes and fewer L0 files but bigger write stalls when flushing; smaller → more frequent flush/compaction and better latency stability.
-- `memtable_shard_count` – More shards reduce write lock contention; too many shards increase flush sort/merge cost.
 - `sync_wal` / `WriteOptions::sync` – `true` fsyncs every write (strong durability, higher latency). `false` relies on OS buffering; combine with `wal_sync_interval_ms` for periodic sync.
 - `wal_sync_interval_ms` – Background WAL fsync cadence. Non-zero lowers per-op latency but risks bounded data loss up to the interval.
 - `flush_thread_count` – Number of background threads flushing immutable memtables to L0 SSTables. Larger can increase throughput if flush is CPU-bound; too large can contend on disk.

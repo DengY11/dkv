@@ -111,12 +111,12 @@ CrudStats BenchDKVSingle(const Args& args, Mode mode) {
 
   dkv::Options opts;
   opts.data_dir = dir;
-  opts.memtable_soft_limit_bytes = 128 * 1024 * 1024;
+  opts.memtable_soft_limit_bytes = 512 * 1024 * 1024;
   opts.sync_wal = sync;
   opts.sstable_block_size_bytes = 16 * 1024;
   opts.bloom_bits_per_key = 8;
   opts.level0_file_limit = 4;
-  opts.sstable_target_size_bytes = 64 * 1024 * 1024;
+  opts.sstable_target_size_bytes = 512 * 1024 * 1024;
   opts.max_immutable_memtables = 4;
   opts.flush_thread_count = 4;
   opts.compaction_thread_count = 3;

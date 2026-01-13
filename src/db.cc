@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <functional>
 #include <shared_mutex>
 #include <set>
 #include <sstream>
@@ -21,12 +22,14 @@
 #include <atomic>
 #include <algorithm>
 #include <deque>
+#include <queue>
 #include "block_cache.h"
 #include "bloom_cache.h"
 #include "memtable.h"
 #include "sstable.h"
 #include "wal.h"
 #include "util.h"
+#include "dkv/filename.h"
 
 namespace dkv {
 
@@ -46,9 +49,9 @@ class DB::Impl {
       : options_(std::move(options)),
         options_ptr_(std::make_shared<const Options>(options_)),
         data_dir_(options_.data_dir),
-        wal_path_(data_dir_ / "wal.log"),
+        wal_path_(data_dir_ / std::string(kWalActiveName)),
         sst_dir_(data_dir_ / "sst"),
-        mem_(std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes)) {}
+        mem_(std::make_unique<MemTable>(options_.memtable_soft_limit_bytes)) {}
   ~Impl();
 
   Status Init();
@@ -86,7 +89,8 @@ class DB::Impl {
   void CompactThreadLoop();
   void EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
   Status FlushImmutable(const std::shared_ptr<ImmutableMem>& imm);
-  Status BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq);
+  Status BuildMergedView(std::vector<std::pair<std::string, std::string>>& out, std::string_view prefix,
+                         std::uint64_t snapshot_seq);
   std::uint64_t SnapshotSeq(const ReadOptions& options) const;
   std::uint64_t RegisterSnapshot(std::uint64_t seq);
   void UnregisterSnapshot(std::uint64_t seq);
@@ -150,7 +154,9 @@ class DB::Impl {
   mutable std::mutex compact_status_mu_;
   Status last_compact_status_{Status::OK()};
 
-  std::shared_mutex mu_;  // shared for reads/writes; unique for flush/compaction/wal rotation.
+  // Guards global DB state (seq allocation, WAL rotation, immutable queue, version metadata).
+  // Shared for normal reads/writes; upgraded to unique for rotate/flush/compaction that mutate state.
+  std::shared_mutex mu_;
   std::atomic<std::uint64_t> next_seq_{1};
 
   std::thread wal_sync_thread_;
@@ -214,13 +220,17 @@ Status DB::Impl::Init() {
   for (const auto& entry : std::filesystem::directory_iterator(data_dir_)) {
     if (!entry.is_regular_file()) continue;
     const auto name = entry.path().filename().string();
-    if (name.rfind("wal-", 0) == 0 && entry.path().extension() == ".log") {
-      auto num_str = name.substr(4, name.size() - 4 - 4);  // strip wal- and .log
-      try {
-        auto seq = static_cast<std::uint64_t>(std::stoull(num_str));
-        wal_segments.emplace_back(seq, entry.path());
-      } catch (...) {
-        continue;
+    if (name.rfind(kWalPrefix, 0) == 0 && entry.path().extension() == kWalExtension) {
+      const std::size_t prefix_len = kWalPrefix.size();
+      const std::size_t ext_len = kWalExtension.size();
+      if (name.size() > prefix_len + ext_len) {
+        auto num_str = name.substr(prefix_len, name.size() - prefix_len - ext_len);
+        try {
+          auto seq = static_cast<std::uint64_t>(std::stoull(num_str));
+          wal_segments.emplace_back(seq, entry.path());
+        } catch (...) {
+          continue;
+        }
       }
     }
   }
@@ -300,7 +310,7 @@ Status DB::Impl::LoadSSTables() {
   std::vector<std::vector<TableRef>> loaded;
   bool manifest_loaded = false;
   // Try manifest first.
-  if (std::filesystem::exists(data_dir_ / "MANIFEST")) {
+  if (std::filesystem::exists(data_dir_ / std::string(kManifestName))) {
     Status ms = LoadManifest(loaded);
     if (!ms.ok()) return ms;
     manifest_loaded = !loaded.empty();
@@ -381,7 +391,7 @@ Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string v
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
@@ -407,7 +417,7 @@ Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
@@ -457,7 +467,7 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
     std::unique_lock lk(mu_);
     if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
       auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       Status s = RotateWalLocked(seqs.back(), rotated);
       if (!s.ok()) return s;
@@ -515,48 +525,121 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
   return Status::NotFound("missing");
 }
 
-Status DB::Impl::BuildMergedView(std::map<std::string, MemEntry>& merged, std::uint64_t snapshot_seq) {
-  std::vector<MemEntry> mem_entries;
-  std::vector<std::shared_ptr<ImmutableMem>> imm_copy;
+Status DB::Impl::BuildMergedView(std::vector<std::pair<std::string, std::string>>& out, std::string_view prefix,
+                                 std::uint64_t snapshot_seq) {
+  struct Cursor {
+    std::function<bool(MemEntry&)> next;
+  };
+
+  std::vector<Cursor> cursors;
+  // Active memtable and immutables: iterate directly over skip list nodes.
   {
     std::shared_lock mu_lk(mu_);
-    mem_entries = mem_->Snapshot();
-    std::lock_guard lk(flush_mu_);
-    imm_copy.assign(immutables_.begin(), immutables_.end());
-  }
-  for (auto& e : mem_entries) {
-    if (e.seq > snapshot_seq) continue;
-    auto it = merged.find(e.key);
-    if (it == merged.end() || it->second.seq < e.seq) {
-      merged[e.key] = std::move(e);
-    }
-  }
-
-  for (const auto& imm : imm_copy) {
-    if (!imm || !imm->mem) continue;
-    auto imm_entries = imm->mem->Snapshot();
-    for (auto& e : imm_entries) {
-      if (e.seq > snapshot_seq) continue;
-      auto it = merged.find(e.key);
-      if (it == merged.end() || it->second.seq < e.seq) {
-        merged[e.key] = std::move(e);
-      }
-    }
-  }
-
-  std::shared_lock lock(sstable_mu_);
-  for (const auto& level : levels_) {
-    for (const auto& tref : level) {
-      std::vector<MemEntry> entries;
-      Status s = tref.table->LoadAll(entries);
-      if (!s.ok()) return s;
-      for (auto& e : entries) {
-        if (e.seq > snapshot_seq) continue;
-        auto it = merged.find(e.key);
-        if (it == merged.end() || it->second.seq < e.seq) {
-          merged[e.key] = std::move(e);
+    {
+      auto it = mem_->NewIterator();
+      cursors.push_back(Cursor{[cur = it, snapshot_seq](MemEntry& out) mutable {
+        while (cur.Valid()) {
+          auto v = cur.view();
+          cur.Next();
+          if (v.seq > snapshot_seq) continue;
+          out.key = std::string(v.key);
+          out.value = std::string(v.value);
+          out.seq = v.seq;
+          out.deleted = v.deleted;
+          return true;
         }
+        return false;
+      }});
+    }
+    std::lock_guard lk(flush_mu_);
+    for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
+      if (!(*it) || !(*it)->mem) continue;
+      auto iter = (*it)->mem->NewIterator();
+      cursors.push_back(Cursor{[cur = iter, snapshot_seq](MemEntry& out) mutable {
+        while (cur.Valid()) {
+          auto v = cur.view();
+          cur.Next();
+          if (v.seq > snapshot_seq) continue;
+          out.key = std::string(v.key);
+          out.value = std::string(v.value);
+          out.seq = v.seq;
+          out.deleted = v.deleted;
+          return true;
+        }
+        return false;
+      }});
+    }
+  }
+
+  // SSTables: build iterators without loading full contents.
+  std::vector<std::shared_ptr<SSTable>> tables;
+  {
+    std::shared_lock lk(sstable_mu_);
+    for (const auto& level : levels_) {
+      for (const auto& tref : level) tables.push_back(tref.table);
+    }
+  }
+  for (auto& t : tables) {
+    cursors.push_back(Cursor{[cur_it = t->NewIterator(), snapshot_seq](MemEntry& out) mutable {
+      MemEntry tmp;
+      while (cur_it.Next(tmp)) {
+        if (tmp.seq > snapshot_seq) continue;
+        out = std::move(tmp);
+        return true;
       }
+      return false;
+    }});
+  }
+
+  struct Item {
+    std::string key;
+    MemEntry entry;
+    std::size_t cursor_idx{0};
+  };
+  auto cmp = [](const Item& a, const Item& b) { return a.key > b.key; };
+  std::priority_queue<Item, std::vector<Item>, decltype(cmp)> heap(cmp);
+
+  auto advance_and_push = [&](std::size_t i, std::string_view skip_key) {
+    MemEntry e;
+    while (cursors[i].next && cursors[i].next(e)) {
+      if (!skip_key.empty() && e.key == skip_key) continue;
+      heap.push(Item{e.key, std::move(e), i});
+      return;
+    }
+  };
+
+  for (std::size_t i = 0; i < cursors.size(); ++i) {
+    advance_and_push(i, "");
+  }
+
+  while (!heap.empty()) {
+    const std::string current_key = heap.top().key;
+    std::uint64_t best_seq = 0;
+    bool best_deleted = false;
+    std::string best_value;
+
+    std::vector<Item> same_key;
+    while (!heap.empty() && heap.top().key == current_key) {
+      same_key.push_back(std::move(heap.top()));
+      heap.pop();
+    }
+
+    for (const auto& it : same_key) {
+      if (it.entry.seq > best_seq) {
+        best_seq = it.entry.seq;
+        best_deleted = it.entry.deleted;
+        best_value = it.entry.value;
+      }
+    }
+
+    if (!best_deleted) {
+      if (prefix.empty() || current_key.rfind(prefix, 0) == 0) {
+        out.emplace_back(current_key, std::move(best_value));
+      }
+    }
+
+    for (const auto& it : same_key) {
+      advance_and_push(it.cursor_idx, current_key);
     }
   }
   return Status::OK();
@@ -591,8 +674,8 @@ std::uint64_t DB::Impl::MinActiveSnapshot() const {
 
 std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& options, std::string_view prefix) {
   std::uint64_t snap = SnapshotSeq(options);
-  std::map<std::string, MemEntry> merged;
-  Status s = BuildMergedView(merged, snap);
+  std::vector<std::pair<std::string, std::string>> merged;
+  Status s = BuildMergedView(merged, prefix, snap);
   auto rep = std::make_unique<DB::Iterator::Rep>();
   rep->prefix.assign(prefix);
   rep->snapshot_seq = snap;
@@ -601,12 +684,7 @@ std::unique_ptr<DB::Iterator> DB::Impl::NewIterator(const ReadOptions& options, 
     return std::unique_ptr<DB::Iterator>(new DB::Iterator(std::move(rep)));
   }
 
-  rep->data.reserve(merged.size());
-  for (auto& kv : merged) {
-    if (kv.second.deleted) continue;
-    if (!rep->prefix.empty() && kv.first.rfind(rep->prefix, 0) != 0) continue;
-    rep->data.emplace_back(std::move(kv.first), std::move(kv.second.value));
-  }
+  rep->data = std::move(merged);
   rep->pos = rep->data.empty() ? rep->data.size() : 0;  // pos==size means invalid; use 0 if non-empty
   if (options.snapshot || options.snapshot_seq != 0) {
     rep->registered = true;
@@ -632,7 +710,7 @@ Status DB::Impl::FlushLocked() {
   if (mem_->Empty() && immutables_.empty()) return Status::OK();
   if (!mem_->Empty()) {
     auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>(options_.memtable_shard_count, options_.memtable_soft_limit_bytes);
+    mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
     std::filesystem::path rotated;
     auto cur = next_seq_.load(std::memory_order_relaxed);
     std::uint64_t max_seq = cur ? cur - 1 : 0;
@@ -658,9 +736,9 @@ Status DB::Impl::WriteManifest() {
     }
   }
 
-  const auto manifest_tmp =
-      data_dir_ / ("MANIFEST.tmp." + std::to_string(manifest_tmp_seq_.fetch_add(1, std::memory_order_relaxed)));
-  const auto manifest = data_dir_ / "MANIFEST";
+    const auto manifest_tmp = data_dir_ / (std::string(kManifestTmpPrefix) +
+                                           std::to_string(manifest_tmp_seq_.fetch_add(1, std::memory_order_relaxed)));
+  const auto manifest = data_dir_ / std::string(kManifestName);
   {
     std::ofstream out(manifest_tmp, std::ios::binary | std::ios::trunc);
     if (!out.is_open()) return Status::IOError("open MANIFEST.tmp failed");
@@ -685,7 +763,7 @@ Status DB::Impl::WriteManifest() {
 }
 
 Status DB::Impl::LoadManifest(std::vector<std::vector<TableRef>>& loaded) {
-  const auto manifest = data_dir_ / "MANIFEST";
+  const auto manifest = data_dir_ / std::string(kManifestName);
   std::ifstream in(manifest);
   if (!in.is_open()) return Status::IOError("failed to open MANIFEST");
   std::string header;
@@ -862,7 +940,8 @@ Status DB::Impl::RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem:
   // Assume mu_ is held.
   std::lock_guard guard(wal_sync_mu_);
   wal_->Close();
-  rotated_path = data_dir_ / ("wal-" + std::to_string(max_seq_for_old) + ".log");
+      rotated_path =
+          data_dir_ / (std::string(kWalPrefix) + std::to_string(max_seq_for_old) + std::string(kWalExtension));
   std::error_code ec;
   std::filesystem::rename(wal_path_, rotated_path, ec);
   if (ec) return Status::IOError("failed to rotate wal: " + ec.message());

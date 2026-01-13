@@ -1,252 +1,274 @@
 #include "memtable.h"
 
-#include <algorithm>
-#include <cstddef>
-#include <climits>
-#include <functional>
+#include <atomic>
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 #include <mutex>
-#include <memory>
-#include <queue>
-#include <utility>
-#include <new>
+#include <random>
+#include <string>
+#include <string_view>
 #include <vector>
 
+#include "util.h"
+
 namespace dkv {
-
 namespace {
-static inline std::hash<std::string_view> global_hash{};
-inline std::size_t KeyHash(std::string_view key) { return global_hash(key); }
-inline std::size_t NextPow2(std::size_t v) {
-  if (v <= 1) return 1;
-  --v;
-  v |= v >> 1;
-  v |= v >> 2;
-  v |= v >> 4;
-  v |= v >> 8;
-  v |= v >> 16;
-#if ULONG_MAX > 0xFFFFFFFF
-  v |= v >> 32;
-#endif
-  return v + 1;
-}
 
-struct TransparentHash {
-  using is_transparent = void;
-  std::size_t operator()(std::string_view key) const { return std::hash<std::string_view>{}(key); }
+constexpr int kMaxHeight = 16;
+
+struct Node {
+  std::string_view key;
+  std::string_view value;
+  std::uint64_t seq{0};
+  bool deleted{false};
+  int height{1};
+  std::atomic<Node*> next[1];
+
+  explicit Node(int h) : height(h) {
+    for (int i = 0; i < h; ++i) {
+      new (&next[i]) std::atomic<Node*>{nullptr};
+    }
+  }
+
+  Node* Next(int n) {
+    assert(n >= 0);
+    return next[n].load(std::memory_order_acquire);
+  }
+  Node* Next(int n) const {
+    assert(n >= 0);
+    return next[n].load(std::memory_order_acquire);
+  }
+  void SetNext(int n, Node* x) {
+    assert(n >= 0);
+    next[n].store(x, std::memory_order_release);
+  }
+  Node* NoBarrier_Next(int n) {
+    assert(n >= 0);
+    return next[n].load(std::memory_order_relaxed);
+  }
+  void NoBarrier_SetNext(int n, Node* x) {
+    assert(n >= 0);
+    next[n].store(x, std::memory_order_relaxed);
+  }
+  int height_levels() const { return height; }
 };
 
-struct TransparentEq {
-  using is_transparent = void;
-  bool operator()(std::string_view a, std::string_view b) const { return a == b; }
-};
-
-class ReusableMonotonicResource : public std::pmr::memory_resource {
+class Arena {
  public:
-  explicit ReusableMonotonicResource(std::size_t block_size, void* initial_buffer, std::size_t initial_size)
-      : block_size_(block_size) {
-    blocks_.push_back(Block{static_cast<std::byte*>(initial_buffer), initial_size, 0, true});
+  explicit Arena(std::size_t initial_bytes) {
+    const std::size_t bytes = initial_bytes ? initial_bytes : kDefaultBlockSize;
+    auto blk = std::make_unique<Block>();
+    blk->size = bytes;
+    blk->data = std::make_unique<char[]>(bytes);
+    blk->offset.store(0, std::memory_order_relaxed);
+    current_.store(blk.get(), std::memory_order_relaxed);
+    blocks_.push_back(std::move(blk));
   }
 
-  void Release() {
-    for (auto& blk : blocks_) {
-      blk.offset = 0;
-      if (!blk.external && blk.data) {
-        delete[] blk.data;
-        blk.data = nullptr;
-        blk.size = 0;
-      }
+  void* AllocateAligned(std::size_t bytes, std::size_t align = alignof(std::max_align_t)) {
+    used_.fetch_add(bytes, std::memory_order_relaxed);
+    while (true) {
+      Block* b = current_.load(std::memory_order_acquire);
+      if (void* ptr = TryAlloc(b, bytes, align)) return ptr;
+
+      std::lock_guard<std::mutex> lk(mu_);
+      b = current_.load(std::memory_order_acquire);
+      if (void* ptr = TryAlloc(b, bytes, align)) return ptr;
+
+      auto blk = std::make_unique<Block>();
+      blk->size = std::max<std::size_t>(bytes + align, kDefaultBlockSize);
+      blk->data = std::make_unique<char[]>(blk->size);
+      blk->offset.store(0, std::memory_order_relaxed);
+      Block* blk_ptr = blk.get();
+      blocks_.push_back(std::move(blk));
+      current_.store(blk_ptr, std::memory_order_release);
+      if (void* ptr = TryAlloc(blk_ptr, bytes, align)) return ptr;
     }
-    if (blocks_.size() > 1) blocks_.resize(1);
   }
 
-  ~ReusableMonotonicResource() override { Release(); }
+  std::size_t Used() const { return used_.load(std::memory_order_relaxed); }
 
-  std::size_t Used() const {
-    std::size_t total = 0;
-    for (const auto& blk : blocks_) total += blk.offset;
-    return total;
-  }
-
- protected:
-  void* do_allocate(std::size_t bytes, std::size_t alignment) override {
-    for (auto& blk : blocks_) {
-      void* ptr = blk.data + blk.offset;
-      std::size_t space = blk.size - blk.offset;
-      void* aligned = ptr;
-      if (std::align(alignment, bytes, aligned, space)) {
-        blk.offset = static_cast<std::size_t>(static_cast<std::byte*>(aligned) - blk.data) + bytes;
-        return aligned;
-      }
-    }
-    // Need new block
-    std::size_t sz = std::max(block_size_, bytes + alignment);
-    auto* buf = new std::byte[sz];
-    blocks_.push_back(Block{buf, sz, 0, false});
-    void* ptr = buf;
-    std::size_t space = sz;
-    void* aligned = ptr;
-    bool ok = std::align(alignment, bytes, aligned, space);
-    (void)ok;
-    blocks_.back().offset = static_cast<std::size_t>(static_cast<std::byte*>(aligned) - buf) + bytes;
-    return aligned;
-  }
-
-  void do_deallocate(void*, std::size_t, std::size_t) override {}
-  bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
-
-  private:
+ private:
   struct Block {
-    std::byte* data{nullptr};
+    std::unique_ptr<char[]> data;
     std::size_t size{0};
-    std::size_t offset{0};
-    bool external{false};
+    std::atomic<std::size_t> offset{0};
   };
 
-  std::size_t block_size_;
-  std::vector<Block> blocks_;
+  static constexpr std::size_t kDefaultBlockSize = 1 << 20;  // 1 MB default slab
+
+  static std::size_t AlignUp(std::size_t n, std::size_t align) {
+    return (n + align - 1) & ~(align - 1);
+  }
+
+  void* TryAlloc(Block* b, std::size_t bytes, std::size_t align) {
+    if (!b) return nullptr;
+    while (true) {
+      std::size_t cur = b->offset.load(std::memory_order_relaxed);
+      std::size_t aligned = AlignUp(cur, align);
+      std::size_t next = aligned + bytes;
+      if (next > b->size) return nullptr;
+      if (b->offset.compare_exchange_weak(cur, next, std::memory_order_acquire,
+                                          std::memory_order_relaxed)) {
+        return b->data.get() + aligned;
+      }
+    }
+  }
+
+  std::vector<std::unique_ptr<Block>> blocks_;
+  std::atomic<Block*> current_{nullptr};
+  std::atomic<std::size_t> used_{0};
+  std::mutex mu_;
 };
-}  // namespace
 
-struct MemTable::Shard {
-  explicit Shard(std::size_t reserve_buckets)
-      : resource_(kInlineArenaSize, inline_arena_.data(), inline_arena_.size()),
-        table_(0, TransparentHash{}, TransparentEq{},
-               std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&resource_}) {
-    if (reserve_buckets > 0) table_.reserve(reserve_buckets);
-  }
-
-  Status Put(std::uint64_t seq, std::string_view key, std::string_view value) {
-    std::unique_lock lk(mu_);
-    auto it = table_.find(key);
-    if (it != table_.end()) {
-      memory_usage_ -= it->second.value.size();
-      it->second.value.assign(value.data(), value.size());
-      it->second.seq = seq;
-      it->second.deleted = false;
-      memory_usage_ += it->second.value.size();
-    } else {
-      auto* res = table_.get_allocator().resource();
-      std::pmr::string key_copy(key.begin(), key.end(), res);
-      std::pmr::string value_copy(value.begin(), value.end(), res);
-      memory_usage_ += key_copy.size() + value_copy.size();
-      table_.emplace(std::move(key_copy), MemValue{std::move(value_copy), seq, false});
+class SkipList {
+ public:
+  explicit SkipList(Arena* arena) : arena_(arena) {
+    head_ = NewNode("", "", 0, false, kMaxHeight);
+    for (int i = 0; i < kMaxHeight; ++i) {
+      head_->SetNext(i, nullptr);
     }
-    return Status::OK();
+    max_height_.store(1, std::memory_order_relaxed);
   }
 
-  Status Delete(std::uint64_t seq, std::string_view key) {
-    std::unique_lock lk(mu_);
-    auto it = table_.find(key);
-    if (it != table_.end()) {
-      memory_usage_ -= it->second.value.size();
-      it->second.value.clear();
-      it->second.seq = seq;
-      it->second.deleted = true;
-    } else {
-      auto* res = table_.get_allocator().resource();
-      std::pmr::string key_copy(key.begin(), key.end(), res);
-      memory_usage_ += key_copy.size();
-      table_.emplace(std::move(key_copy), MemValue{std::pmr::string(res), seq, true});
+  void Insert(std::string_view key, std::string_view value, std::uint64_t seq, bool deleted) {
+    Node* prev[kMaxHeight];
+    Node* x = FindGreaterOrEqual(key, seq, prev);
+
+    int height = RandomHeight();
+    int cur_max = max_height_.load(std::memory_order_relaxed);
+    if (height > cur_max) {
+      for (int i = cur_max; i < height; ++i) {
+        prev[i] = head_;
+      }
+      max_height_.store(height, std::memory_order_relaxed);
     }
-    return Status::OK();
+
+    x = NewNode(key, value, seq, deleted, height);
+    for (int i = 0; i < height; ++i) {
+      x->NoBarrier_SetNext(i, prev[i]->NoBarrier_Next(i));
+      prev[i]->SetNext(i, x);
+    }
   }
 
-  bool Get(std::string_view key, MemEntry& entry) const {
-    std::shared_lock lk(mu_);
-    auto it = table_.find(key);
-    if (it == table_.end()) return false;
-    entry.key = it->first;
-    entry.value = it->second.value;
-    entry.seq = it->second.seq;
-    entry.deleted = it->second.deleted;
+  bool GetLatest(std::string_view key, MemEntry& out) const {
+    Node* x = FindGreaterOrEqual(key, std::numeric_limits<std::uint64_t>::max(), nullptr);
+    if (!x || x->key != key) return false;
+    out.key = std::string(x->key);
+    out.value = std::string(x->value);
+    out.seq = x->seq;
+    out.deleted = x->deleted;
     return true;
   }
 
-  void Snapshot(std::vector<MemEntry>& out) const {
-    std::shared_lock lk(mu_);
-    out.reserve(out.size() + table_.size());
-    for (const auto& kv : table_) {
-      out.push_back(MemEntry{std::string(kv.first), std::string(kv.second.value), kv.second.seq,
-                             kv.second.deleted});
-    }
-  }
-
   void SnapshotViews(std::vector<MemEntryView>& out) const {
-    std::shared_lock lk(mu_);
-    out.reserve(out.size() + table_.size());
-    for (const auto& kv : table_) {
-      out.push_back(MemEntryView{std::string_view(kv.first), std::string_view(kv.second.value), kv.second.seq,
-                                 kv.second.deleted});
+    Node* x = head_->Next(0);
+    while (x != nullptr) {
+      out.push_back(MemEntryView{x->key, x->value, x->seq, x->deleted});
+      x = x->Next(0);
     }
   }
 
-  void Clear() {
-    std::unique_lock lk(mu_);
-    table_.clear();
-    resource_.Release();
-    table_ = decltype(table_)(0, TransparentHash{}, TransparentEq{},
-                              std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, MemValue>>{&resource_});
-    memory_usage_ = 0;
+  bool Empty() const { return head_->Next(0) == nullptr; }
+
+  Node* HeadNext() const { return head_->Next(0); }
+
+ private:
+  Node* NewNode(std::string_view key, std::string_view value, std::uint64_t seq, bool deleted, int height) {
+    char* mem =
+        static_cast<char*>(arena_->AllocateAligned(sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1), alignof(Node)));
+    auto* n = new (mem) Node(height);
+    n->seq = seq;
+    n->deleted = deleted;
+
+    char* kbuf = static_cast<char*>(arena_->AllocateAligned(key.size(), alignof(char)));
+    std::memcpy(kbuf, key.data(), key.size());
+    n->key = std::string_view(kbuf, key.size());
+    if (!value.empty()) {
+      char* vbuf = static_cast<char*>(arena_->AllocateAligned(value.size(), alignof(char)));
+      std::memcpy(vbuf, value.data(), value.size());
+      n->value = std::string_view(vbuf, value.size());
+    }
+    return n;
   }
 
-  std::size_t ApproximateMemoryUsage() const {
-    std::shared_lock lk(mu_);
-    return resource_.Used();
+  // Comparator: order by key ascending, then seq descending (higher seq first).
+  int Compare(const Node* a, std::string_view b_key, std::uint64_t b_seq) const {
+    int cmp = a->key.compare(b_key);
+    if (cmp == 0) {
+      if (a->seq == b_seq) return 0;
+      return a->seq > b_seq ? -1 : 1;
+    }
+    return cmp;
   }
 
-  bool Empty() const {
-    std::shared_lock lk(mu_);
-    return table_.empty();
+  bool KeyIsAfterNode(std::string_view key, std::uint64_t seq, Node* n) const {
+    return (n != nullptr) && (Compare(n, key, seq) < 0);
   }
 
-  mutable std::shared_mutex mu_;
-  static constexpr std::size_t kInlineArenaSize = 256 * 1024;
-  alignas(std::max_align_t) std::array<std::byte, kInlineArenaSize> inline_arena_{};
-  ReusableMonotonicResource resource_;
-  std::pmr::unordered_map<std::pmr::string, MemValue, TransparentHash, TransparentEq> table_;
-  std::size_t memory_usage_{0};
+  Node* FindGreaterOrEqual(std::string_view key, std::uint64_t seq, Node** prev) const {
+    Node* x = head_;
+    int level = max_height_.load(std::memory_order_relaxed) - 1;
+    while (true) {
+      Node* next = x->Next(level);
+      if (KeyIsAfterNode(key, seq, next)) {
+        x = next;
+      } else {
+        if (prev != nullptr) prev[level] = x;
+        if (level == 0) {
+          return next;
+        }
+        --level;
+      }
+    }
+  }
+
+  int RandomHeight() {
+    static thread_local std::mt19937 rng(std::random_device{}());
+    static thread_local std::uniform_int_distribution<int> dist(0, std::numeric_limits<int>::max());
+    int height = 1;
+    while (height < kMaxHeight && (dist(rng) & 3) == 0) {  // 1/4 branching like LevelDB
+      ++height;
+    }
+    return height;
+  }
+
+  Arena* arena_;
+  Node* head_{nullptr};
+  std::atomic<int> max_height_{1};
 };
 
-MemTable::MemTable(std::size_t shard_count, std::size_t approx_capacity_bytes) {
-  shard_count_ = shard_count == 0 ? 1 : shard_count;
-  // Use power-of-two shard count to replace modulo with mask.
-  shard_count_ = NextPow2(shard_count_);
-  shard_mask_ = shard_count_ - 1;
-  shards_.reserve(shard_count_);
-  constexpr std::size_t kMinBucketsPerShard = 1 << 15;
-  constexpr std::size_t kApproxEntryBytes = 64;  // rough key+value size for bucket sizing
-  std::size_t reserve_buckets = kMinBucketsPerShard;
-  if (approx_capacity_bytes > 0) {
-    const auto approx_entries = approx_capacity_bytes / kApproxEntryBytes;
-    const auto per_shard = approx_entries / shard_count_;
-    if (per_shard > reserve_buckets) {
-      reserve_buckets = per_shard;
-    }
-  }
-  for (std::size_t i = 0; i < shard_count_; ++i) {
-    shards_.push_back(std::make_unique<Shard>(reserve_buckets));
-  }
-  base_usage_ = RawMemoryUsage();
-}
+}  // namespace
+
+struct MemTable::Impl {
+  explicit Impl(std::size_t approx_bytes)
+      : arena(std::make_unique<Arena>(approx_bytes)), list(std::make_unique<SkipList>(arena.get())) {}
+
+  std::unique_ptr<Arena> arena;
+  std::unique_ptr<SkipList> list;
+  std::mutex write_mu;
+};
+
+MemTable::MemTable(std::size_t approx_capacity_bytes) : impl_(std::make_unique<Impl>(approx_capacity_bytes)) {}
 
 MemTable::~MemTable() = default;
 
 Status MemTable::Put(std::uint64_t seq, std::string_view key, std::string_view value) {
-  const auto h = KeyHash(key);
-  auto shard = shards_[h & shard_mask_].get();
-  return shard->Put(seq, key, value);
+  std::lock_guard<std::mutex> lk(impl_->write_mu);
+  impl_->list->Insert(key, value, seq, false);
+  return Status::OK();
 }
 
 Status MemTable::Delete(std::uint64_t seq, std::string_view key) {
-  const auto h = KeyHash(key);
-  auto shard = shards_[h & shard_mask_].get();
-  return shard->Delete(seq, key);
+  std::lock_guard<std::mutex> lk(impl_->write_mu);
+  impl_->list->Insert(key, std::string_view{}, seq, true);
+  return Status::OK();
 }
 
 bool MemTable::Get(std::string_view key, MemEntry& entry) const {
-  const auto h = KeyHash(key);
-  auto shard = shards_[h & shard_mask_].get();
-  return shard->Get(key, entry);
+  return impl_->list->GetLatest(key, entry);
 }
 
 std::vector<MemEntry> MemTable::Snapshot() const {
@@ -260,76 +282,32 @@ std::vector<MemEntry> MemTable::Snapshot() const {
 }
 
 std::vector<MemEntryView> MemTable::SnapshotViews() const {
-  struct ShardBuf {
-    std::vector<MemEntryView> entries;
-  };
-  std::vector<ShardBuf> shards_sorted;
-  shards_sorted.reserve(shard_count_);
-  std::size_t total = 0;
-
-  for (const auto& shard : shards_) {
-    ShardBuf buf;
-    shard->SnapshotViews(buf.entries);
-    std::sort(buf.entries.begin(), buf.entries.end(),
-              [](const MemEntryView& a, const MemEntryView& b) { return a.key < b.key; });
-    total += buf.entries.size();
-    shards_sorted.push_back(std::move(buf));
-  }
-
   std::vector<MemEntryView> out;
-  out.reserve(total);
-  struct HeapItem {
-    std::size_t shard_idx;
-    std::size_t elem_idx;
-  };
-  auto cmp = [&](const HeapItem& a, const HeapItem& b) {
-    return shards_sorted[a.shard_idx].entries[a.elem_idx].key >
-           shards_sorted[b.shard_idx].entries[b.elem_idx].key;
-  };
-  std::priority_queue<HeapItem, std::vector<HeapItem>, decltype(cmp)> heap(cmp);
-  for (std::size_t i = 0; i < shards_sorted.size(); ++i) {
-    if (!shards_sorted[i].entries.empty()) heap.push(HeapItem{i, 0});
-  }
-
-  while (!heap.empty()) {
-    auto cur = heap.top();
-    heap.pop();
-    const auto& e = shards_sorted[cur.shard_idx].entries[cur.elem_idx];
-    out.push_back(e);
-    ++cur.elem_idx;
-    if (cur.elem_idx < shards_sorted[cur.shard_idx].entries.size()) {
-      heap.push(cur);
-    }
-  }
+  impl_->list->SnapshotViews(out);
   return out;
 }
 
 void MemTable::Clear() {
-  for (auto& shard : shards_) {
-    shard->Clear();
-  }
-  base_usage_ = RawMemoryUsage();
+  const std::size_t approx = impl_->arena->Used();
+  impl_ = std::make_unique<Impl>(approx);
 }
 
-std::size_t MemTable::ApproximateMemoryUsage() const {
-  const std::size_t raw = RawMemoryUsage();
-  if (raw <= base_usage_) return 0;
-  return raw - base_usage_;
+std::size_t MemTable::ApproximateMemoryUsage() const { return impl_->arena->Used(); }
+
+bool MemTable::Empty() const { return impl_->list->Empty(); }
+
+MemTable::Iterator MemTable::NewIterator() const { return Iterator(impl_->list->HeadNext()); }
+
+bool MemTable::Iterator::Valid() const { return node_ != nullptr; }
+
+void MemTable::Iterator::Next() {
+  if (!node_) return;
+  node_ = static_cast<const Node*>(node_)->Next(0);
 }
 
-bool MemTable::Empty() const {
-  for (const auto& shard : shards_) {
-    if (!shard->Empty()) return false;
-  }
-  return true;
-}
-
-std::size_t MemTable::RawMemoryUsage() const {
-  std::size_t total = 0;
-  for (const auto& shard : shards_) {
-    total += shard->ApproximateMemoryUsage();
-  }
-  return total;
+MemEntryView MemTable::Iterator::view() const {
+  const Node* n = static_cast<const Node*>(node_);
+  return MemEntryView{n->key, n->value, n->seq, n->deleted};
 }
 
 }  // namespace dkv

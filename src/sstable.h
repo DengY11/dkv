@@ -3,9 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,6 +13,7 @@
 #include "dkv/options.h"
 #include "memtable.h"
 #include "bloom.h"
+#include "random_access_file.h"
 #include "util.h"
 
 namespace dkv {
@@ -34,6 +33,20 @@ class SSTable {
   Status LoadAll(std::vector<MemEntry>& out) const;
   Status Scan(std::string_view from, std::size_t limit,
               std::vector<std::pair<std::string, std::string>>& out) const;
+  class Iterator {
+   public:
+    bool Next(MemEntry& out);
+
+   private:
+    friend class SSTable;
+    Iterator(const SSTable* t, std::size_t block_idx, std::size_t entry_idx)
+        : table_(t), block_idx_(block_idx), entry_idx_(entry_idx) {}
+    const SSTable* table_{nullptr};
+    std::size_t block_idx_{0};
+    std::size_t entry_idx_{0};
+    std::shared_ptr<const std::vector<MemEntry>> block_;
+  };
+  Iterator NewIterator() const;
 
   [[nodiscard]] const std::filesystem::path& path() const { return path_; }
   [[nodiscard]] std::uint64_t max_sequence() const { return max_seq_; }
@@ -55,7 +68,7 @@ class SSTable {
           std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
           std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
           std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
-          std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<const Options> options,
+          std::shared_ptr<BloomCache> bloom_cache, RandomAccessFile file, std::shared_ptr<const Options> options,
           std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors);
 
   std::shared_ptr<BloomCache::Data> LoadBloom() const;
@@ -77,6 +90,7 @@ class SSTable {
   std::shared_ptr<BlockCache> cache_;
   std::shared_ptr<RawBlockCache> raw_cache_;
   std::shared_ptr<BloomCache> bloom_cache_;
+  RandomAccessFile file_;
   std::shared_ptr<const Options> options_;
   std::atomic<std::uint64_t>* crc_error_counter_{nullptr};
   std::atomic<std::uint64_t>* read_error_counter_{nullptr};
@@ -85,8 +99,6 @@ class SSTable {
   bool pin_bloom_{false};
   mutable std::weak_ptr<BloomCache::Data> bloom_ref_;
   mutable std::shared_ptr<BloomCache::Data> pinned_bloom_;
-  mutable std::ifstream file_;
-  mutable std::mutex io_mu_;
 };
 
 }  // namespace dkv
