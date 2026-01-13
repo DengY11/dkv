@@ -58,7 +58,8 @@ class SSTable {
 
  private:
   struct BlockIndexEntry {
-    std::string key;
+    std::string min_key;
+    std::string max_key;
     std::uint64_t offset{0};
     std::uint32_t size{0};
   };
