@@ -404,7 +404,7 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
     return Status::Corruption("bad bloom header: " + path.string());
   }
 
-  std::string min_key = index.front().key;
+  std::string min_key = index.front().min_key;
   RandomAccessFile raf;
   Status fs = raf.Open(path);
   if (!fs.ok()) return fs;
