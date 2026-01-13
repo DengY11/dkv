@@ -34,6 +34,13 @@ struct BlockHeader {
   std::uint32_t crc{0};         // CRC32 of raw payload (uncompressed)
 };
 
+inline std::uint32_t DecodeFixed32(const char* p) {
+  return static_cast<std::uint32_t>(static_cast<unsigned char>(p[0])) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(p[1])) << 8u) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(p[2])) << 16u) |
+         (static_cast<std::uint32_t>(static_cast<unsigned char>(p[3])) << 24u);
+}
+
 static bool DecompressData(std::uint8_t code, std::string_view input, std::string& output, std::size_t raw_size);
 
 inline void AppendU8(std::string& buf, std::uint8_t v) { buf.push_back(static_cast<char>(v)); }
@@ -266,7 +273,7 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
                  std::string max_key, std::uint64_t max_seq, std::uint64_t file_size, std::uint64_t bloom_start,
                  std::uint32_t bloom_bytes, std::uint32_t bloom_bits_per_key, bool pin_bloom,
                  std::shared_ptr<BlockCache> cache, std::shared_ptr<RawBlockCache> raw_cache,
-                 std::shared_ptr<BloomCache> bloom_cache, std::shared_ptr<const Options> options,
+                 std::shared_ptr<BloomCache> bloom_cache, RandomAccessFile file, std::shared_ptr<const Options> options,
                  std::atomic<std::uint64_t>* crc_errors, std::atomic<std::uint64_t>* read_errors)
     : path_(std::move(path)),
       path_ref_(std::make_shared<std::string>(path_.string())),
@@ -279,13 +286,13 @@ SSTable::SSTable(std::filesystem::path path, std::vector<BlockIndexEntry> index,
       cache_(std::move(cache)),
       raw_cache_(std::move(raw_cache)),
       bloom_cache_(std::move(bloom_cache)),
+      file_(std::move(file)),
       options_(std::move(options)),
       crc_error_counter_(crc_errors),
       read_error_counter_(read_errors),
       bloom_bytes_(bloom_bytes),
       bloom_bits_per_key_(bloom_bits_per_key),
-      pin_bloom_(pin_bloom),
-      file_(path_, std::ios::binary) {}
+      pin_bloom_(pin_bloom) {}
 
 Status SSTable::Write(const std::filesystem::path& path, const std::vector<MemEntry>& entries,
                      std::size_t block_size, std::size_t bloom_bits_per_key, bool enable_compress) {
@@ -309,17 +316,15 @@ std::shared_ptr<BloomCache::Data> SSTable::LoadBloom() const {
   if (!data) {
     // Load from disk
     std::vector<std::uint8_t> bits(bloom_bytes_, 0);
-    {
-      std::lock_guard lock(io_mu_);
-      if (!file_.is_open())[[unlikely]] return nullptr;
-      file_.clear();
-      file_.seekg(static_cast<std::streamoff>(bloom_start_));
-      std::uint32_t bits_per_key = 0;
-      std::uint32_t bytes = 0;
-      if (!ReadU32(file_, bits_per_key) || !ReadU32(file_, bytes)) return nullptr;
-      if (bytes != bloom_bytes_) return nullptr;
-      if (!file_.read(reinterpret_cast<char*>(bits.data()), static_cast<std::streamsize>(bloom_bytes_))) return nullptr;
-    }
+    char hdr[8];
+    Status hs = file_.Read(bloom_start_, sizeof(hdr), hdr);
+    if (!hs.ok()) return nullptr;
+    const std::uint32_t bits_per_key = DecodeFixed32(hdr);
+    const std::uint32_t bytes = DecodeFixed32(hdr + 4);
+    if (bytes != bloom_bytes_) return nullptr;
+    if (bits_per_key == 0) return nullptr;
+    Status rs = file_.Read(bloom_start_ + sizeof(hdr), bloom_bytes_, reinterpret_cast<char*>(bits.data()));
+    if (!rs.ok()) return nullptr;
     const std::uint32_t k = std::max<std::uint32_t>(1, static_cast<std::uint32_t>(bloom_bits_per_key_ * 0.69));
     if (bloom_cache_) {
       data = bloom_cache_->Put(path_.string(), std::move(bits), static_cast<std::uint32_t>(bloom_bits_per_key_), k);
@@ -434,11 +439,13 @@ Status SSTable::Open(const std::filesystem::path& path, const std::shared_ptr<Bl
   }
 
   std::string min_key = index.front().key;
+  RandomAccessFile raf;
+  Status fs = raf.Open(path);
+  if (!fs.ok()) return fs;
   auto sstable = std::shared_ptr<SSTable>(new SSTable(path, std::move(index), std::move(min_key), max_key,
                                                       footer.max_seq, *size_opt, footer.bloom_start, bloom_bytes,
                                                       bloom_bits, pin_bloom, cache, raw_cache, bloom_cache,
-                                                      std::move(options), crc_errors, read_errors));
-  if (!sstable->file_.is_open()) return Status::IOError("failed to open sstable reader: " + path.string());
+                                                      std::move(raf), std::move(options), crc_errors, read_errors));
   out = std::move(sstable);
   return Status::OK();
 }
@@ -556,20 +563,15 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
       };
       const char* buf = raw_cached->data();
       const std::size_t buf_size = raw_cached->size();
-      if (buf_size < sizeof(std::uint32_t) * 2 + sizeof(std::uint8_t) + sizeof(std::uint32_t))[[unlikely]] {
+      constexpr std::size_t header_bytes = 4 + 4 + 1 + 4;
+      if (buf_size < header_bytes)[[unlikely]] {
         record_read_error();
         return false;
       }
-      std::uint32_t raw_size = 0;
-      std::uint32_t stored_size = 0;
-      std::uint8_t compression = 0;
-      std::uint32_t hdr_crc = 0;
-      std::memcpy(&raw_size, buf, sizeof(raw_size));
-      std::memcpy(&stored_size, buf + sizeof(raw_size), sizeof(stored_size));
-      std::memcpy(&compression, buf + sizeof(raw_size) + sizeof(stored_size), sizeof(compression));
-      std::memcpy(&hdr_crc, buf + sizeof(raw_size) + sizeof(stored_size) + sizeof(compression), sizeof(hdr_crc));
-      const std::size_t header_bytes =
-          sizeof(raw_size) + sizeof(stored_size) + sizeof(compression) + sizeof(hdr_crc);
+      const std::uint32_t raw_size = DecodeFixed32(buf);
+      const std::uint32_t stored_size = DecodeFixed32(buf + 4);
+      const std::uint8_t compression = static_cast<std::uint8_t>(buf[8]);
+      const std::uint32_t hdr_crc = DecodeFixed32(buf + 9);
       if (header_bytes + stored_size > buf_size)[[unlikely]] {
         record_read_error();
         return false;
@@ -578,13 +580,17 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
       std::string raw;
       std::string_view data_view;
       if (compression != 0) {
-        if (!DecompressData(compression, raw_cached->substr(header_bytes, stored_size), raw, raw_size)) {
+        if (!DecompressData(compression, std::string_view(buf + header_bytes, stored_size), raw, raw_size)) {
           record_read_error();
           return false;
         }
         data_view = raw;
       } else {
-        data_view = std::string_view(raw_cached->data() + header_bytes, raw_size);
+        if (raw_size != stored_size)[[unlikely]] {
+          record_read_error();
+          return false;
+        }
+        data_view = std::string_view(buf + header_bytes, raw_size);
       }
       if (data_view.size() != raw_size) {
         record_read_error();
@@ -641,39 +647,29 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
     if (read_error_counter_) read_error_counter_->fetch_add(1, std::memory_order_relaxed);
   };
 
-  std::lock_guard lock(io_mu_);
-  if (!file_.is_open()) {
+  constexpr std::size_t header_bytes = 4 + 4 + 1 + 4;
+  if (size < header_bytes)[[unlikely]] {
     record_read_error();
     return false;
   }
-  file_.clear();
-  file_.seekg(static_cast<std::streamoff>(start));
+  std::string raw_block(static_cast<std::size_t>(size), '\0');
+  Status rs = file_.Read(start, static_cast<std::size_t>(size), raw_block.data());
+  if (!rs.ok()) {
+    record_read_error();
+    return false;
+  }
 
   BlockHeader hdr;
-  if (!ReadU32(file_, hdr.raw_size) || !ReadU32(file_, hdr.stored_size)) {
-    record_read_error();
-    return false;
-  }
-  if (!ReadU8(file_, hdr.compression)) {
-    record_read_error();
-    return false;
-  }
-  if (!ReadU32(file_, hdr.crc)) {
-    record_read_error();
-    return false;
-  }
-  const std::uint64_t header_bytes =
-      sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression) + sizeof(hdr.crc);
+  hdr.raw_size = DecodeFixed32(raw_block.data());
+  hdr.stored_size = DecodeFixed32(raw_block.data() + 4);
+  hdr.compression = static_cast<std::uint8_t>(raw_block[8]);
+  hdr.crc = DecodeFixed32(raw_block.data() + 9);
   if (header_bytes + hdr.stored_size > size)[[unlikely]] {
     record_read_error();
     return false;
   }
 
-  std::string payload(hdr.stored_size, '\0');
-  if (!file_.read(payload.data(), static_cast<std::streamsize>(hdr.stored_size))) {
-    record_read_error();
-    return false;
-  }
+  const std::string_view payload(raw_block.data() + header_bytes, hdr.stored_size);
 
   std::string raw;
   std::string_view data_view;
@@ -684,7 +680,11 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
     }
     data_view = raw;
   } else {
-    data_view = payload;
+    if (hdr.raw_size != hdr.stored_size)[[unlikely]] {
+      record_read_error();
+      return false;
+    }
+    data_view = std::string_view(payload.data(), hdr.raw_size);
   }
   if (data_view.size() != hdr.raw_size) {
     record_read_error();
@@ -732,15 +732,6 @@ bool SSTable::ReadBlock(std::uint64_t start, std::uint64_t size,
     vec->push_back(std::move(e));
   }
   if (raw_cache_) {
-    std::string raw_block;
-    raw_block.resize(static_cast<std::size_t>(header_bytes + hdr.stored_size));
-    std::memcpy(raw_block.data(), &hdr.raw_size, sizeof(hdr.raw_size));
-    std::memcpy(raw_block.data() + sizeof(hdr.raw_size), &hdr.stored_size, sizeof(hdr.stored_size));
-    std::memcpy(raw_block.data() + sizeof(hdr.raw_size) + sizeof(hdr.stored_size), &hdr.compression,
-                sizeof(hdr.compression));
-    std::memcpy(raw_block.data() + sizeof(hdr.raw_size) + sizeof(hdr.stored_size) + sizeof(hdr.compression),
-                &hdr.crc, sizeof(hdr.crc));
-    std::memcpy(raw_block.data() + header_bytes, payload.data(), hdr.stored_size);
     raw_cache_->Put(path_ref_, start, std::move(raw_block));
   }
   if (cache_) cache_->Put(path_ref_, start, *vec);
