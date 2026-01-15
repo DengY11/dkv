@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <iostream>
+#include <system_error>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -23,7 +24,10 @@ namespace dkv_server {
 struct Acceptor::Impl {
   Impl(std::string bind, int port, std::vector<SubReactor*> subs) : bind_(std::move(bind)), port_(port), subs_(std::move(subs)) {}
 
-  void Start() { thread_ = std::thread([this] { Loop(); }); }
+  void Start() {
+    Setup();
+    thread_ = std::thread([this] { Loop(); });
+  }
 
   void Stop() {
     stopping_.store(true, std::memory_order_relaxed);
@@ -31,29 +35,37 @@ struct Acceptor::Impl {
   }
 
  private:
+  void Setup() {
+    listen_fd_.reset(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
+    if (!listen_fd_.valid()) ThrowSys("socket");
+    SetReuseAddr(listen_fd_.get());
+    SetKeepAlive(listen_fd_.get());
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port_));
+    if (::inet_pton(AF_INET, bind_.c_str(), &addr.sin_addr) != 1) {
+      throw std::runtime_error("invalid bind address: " + bind_);
+    }
+    if (::bind(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+      int err = errno;
+      throw std::system_error(err, std::generic_category(), "bind(" + bind_ + ":" + std::to_string(port_) + ")");
+    }
+    if (::listen(listen_fd_.get(), SOMAXCONN) < 0) {
+      int err = errno;
+      throw std::system_error(err, std::generic_category(), "listen(" + bind_ + ":" + std::to_string(port_) + ")");
+    }
+
+    epoll_fd_.reset(::epoll_create1(EPOLL_CLOEXEC));
+    if (!epoll_fd_.valid()) ThrowSys("epoll_create1");
+    epoll_event ev{};
+    ev.events = EPOLLIN;
+    ev.data.fd = listen_fd_.get();
+    if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, listen_fd_.get(), &ev) < 0) ThrowSys("epoll_ctl(ADD listen)");
+  }
+
   void Loop() {
     try {
-      listen_fd_.reset(::socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-      if (!listen_fd_.valid()) ThrowSys("socket");
-      SetReuseAddr(listen_fd_.get());
-      SetKeepAlive(listen_fd_.get());
-
-      sockaddr_in addr{};
-      addr.sin_family = AF_INET;
-      addr.sin_port = htons(static_cast<uint16_t>(port_));
-      if (::inet_pton(AF_INET, bind_.c_str(), &addr.sin_addr) != 1) {
-        throw std::runtime_error("invalid bind address: " + bind_);
-      }
-      if (::bind(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) ThrowSys("bind");
-      if (::listen(listen_fd_.get(), SOMAXCONN) < 0) ThrowSys("listen");
-
-      epoll_fd_.reset(::epoll_create1(EPOLL_CLOEXEC));
-      if (!epoll_fd_.valid()) ThrowSys("epoll_create1");
-      epoll_event ev{};
-      ev.events = EPOLLIN;
-      ev.data.fd = listen_fd_.get();
-      if (::epoll_ctl(epoll_fd_.get(), EPOLL_CTL_ADD, listen_fd_.get(), &ev) < 0) ThrowSys("epoll_ctl(ADD listen)");
-
       std::vector<epoll_event> events(16);
       while (!stopping_.load(std::memory_order_relaxed)) {
         int n = ::epoll_wait(epoll_fd_.get(), events.data(), static_cast<int>(events.size()), 1000);
