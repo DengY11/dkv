@@ -1,10 +1,13 @@
 #include "commands.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cctype>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -69,6 +72,15 @@ bool ParseInt(std::string_view s, std::int64_t* out) {
   return true;
 }
 
+bool ParseUint64(std::string_view s, std::uint64_t* out) {
+  if (s.empty()) return false;
+  std::uint64_t v = 0;
+  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  if (ec != std::errc() || ptr != s.data() + s.size()) return false;
+  *out = v;
+  return true;
+}
+
 CommandResult CmdPing(const std::vector<std::string>& args, dkv::DB*, const ServerConfig*) {
   CommandResult r;
   if (args.size() == 1) {
@@ -107,6 +119,8 @@ CommandResult CmdClient(const std::vector<std::string>&, dkv::DB*, const ServerC
   resp::AppendSimpleString(r.payload, "OK");
   return r;
 }
+
+
 
 CommandResult CmdHello(const std::vector<std::string>&, dkv::DB*, const ServerConfig*) {
   CommandResult r;
@@ -416,12 +430,311 @@ CommandResult CmdDecrBy(const std::vector<std::string>& args, dkv::DB* db, const
   return DoIncr(args[1], -by, db);
 }
 
+struct IteratorEntry {
+  std::mutex mu;
+  std::unique_ptr<dkv::DB::Iterator> it;
+};
+
+class IteratorRegistry {
+ public:
+  std::uint64_t Create(std::unique_ptr<dkv::DB::Iterator> it) {
+    auto entry = std::make_shared<IteratorEntry>();
+    entry->it = std::move(it);
+    const std::uint64_t id = next_id_.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::lock_guard lk(mu_);
+      iters_.emplace(id, std::move(entry));
+    }
+    return id;
+  }
+
+  std::shared_ptr<IteratorEntry> Get(std::uint64_t id) {
+    std::lock_guard lk(mu_);
+    auto it = iters_.find(id);
+    if (it == iters_.end()) return {};
+    return it->second;
+  }
+
+  bool Erase(std::uint64_t id) {
+    std::lock_guard lk(mu_);
+    return iters_.erase(id) != 0;
+  }
+
+ private:
+  std::mutex mu_;
+  std::unordered_map<std::uint64_t, std::shared_ptr<IteratorEntry>> iters_;
+  std::atomic<std::uint64_t> next_id_{1};
+};
+
+IteratorRegistry& GlobalIterators() {
+  static IteratorRegistry reg;
+  return reg;
+}
+
+void AppendIterState(std::string& out, const dkv::DB::Iterator& it) {
+  const bool valid = it.Valid();
+  resp::AppendArrayHeader(out, 3);
+  resp::AppendInteger(out, valid ? 1 : 0);
+  if (valid) {
+    resp::AppendBulkString(out, it.key());
+    resp::AppendBulkString(out, it.value());
+  } else {
+    resp::AppendNullBulkString(out);
+    resp::AppendNullBulkString(out);
+  }
+}
+
 CommandResult CmdHiDylan(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
   (void)args;
   (void)db;
   (void)cfg;
   CommandResult r;
   resp::AppendSimpleString(r.payload, "Hi, i am dkv author, nice to see you use dkv!!");
+  return r;
+}
+
+CommandResult CmdMetric(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 1) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'metrics' command");
+    return r;
+  }
+  auto m = db->GetMetrics();
+
+  std::vector<std::pair<std::string, std::string>> entries;
+  entries.emplace_back("puts", std::to_string(m.puts));
+  entries.emplace_back("deletes", std::to_string(m.deletes));
+  entries.emplace_back("gets", std::to_string(m.gets));
+  entries.emplace_back("batches", std::to_string(m.batches));
+  entries.emplace_back("flushes", std::to_string(m.flushes));
+  entries.emplace_back("flush_ms", std::to_string(m.flush_ms));
+  entries.emplace_back("flush_bytes", std::to_string(m.flush_bytes));
+  entries.emplace_back("compactions", std::to_string(m.compactions));
+  entries.emplace_back("compaction_ms", std::to_string(m.compaction_ms));
+  entries.emplace_back("compaction_input_bytes", std::to_string(m.compaction_input_bytes));
+  entries.emplace_back("compaction_output_bytes", std::to_string(m.compaction_output_bytes));
+  entries.emplace_back("wal_syncs", std::to_string(m.wal_syncs));
+  entries.emplace_back("sstable_crc_errors", std::to_string(m.sstable_crc_errors));
+  entries.emplace_back("sstable_read_errors", std::to_string(m.sstable_read_errors));
+  entries.emplace_back("block_cache_hits", std::to_string(m.block_cache_hits));
+  entries.emplace_back("block_cache_misses", std::to_string(m.block_cache_misses));
+  entries.emplace_back("block_cache_puts", std::to_string(m.block_cache_puts));
+  entries.emplace_back("block_cache_evictions", std::to_string(m.block_cache_evictions));
+  entries.emplace_back("block_cache_used_bytes", std::to_string(m.block_cache_used_bytes));
+  entries.emplace_back("block_cache_capacity_bytes", std::to_string(m.block_cache_capacity_bytes));
+
+  resp::AppendArrayHeader(r.payload, entries.size() * 2);
+  for (const auto& [k, v] : entries) {
+    resp::AppendBulkString(r.payload, k);
+    resp::AppendBulkString(r.payload, v);
+  }
+  return r;
+}
+
+CommandResult CmdCompact(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 1) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'compact' command");
+    return r;
+  }
+  dkv::Status s = db->Compact();
+  if (s.ok()) {
+    resp::AppendSimpleString(r.payload, "OK");
+  } else {
+    resp::AppendError(r.payload, std::string("ERR ") + s.ToString());
+  }
+  return r;
+}
+
+CommandResult CmdFlush(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 1) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'flush' command");
+    return r;
+  }
+  dkv::Status s = db->Flush();
+  if (s.ok()) {
+    resp::AppendSimpleString(r.payload, "OK");
+  } else {
+    resp::AppendError(r.payload, std::string("ERR ") + s.ToString());
+  }
+  return r;
+}
+
+CommandResult CmdScan(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)cfg;
+  CommandResult r;
+  if (args.size() > 2) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'scan' command");
+    return r;
+  }
+  std::string_view prefix;
+  if (args.size() == 2) prefix = args[1];
+
+  auto it = db->Scan(dkv::ReadOptions{}, prefix);
+  if (!it) {
+    resp::AppendError(r.payload, "ERR scan failed");
+    return r;
+  }
+  dkv::Status st = it->status();
+  if (!st.ok()) {
+    resp::AppendError(r.payload, std::string("ERR ") + st.ToString());
+    return r;
+  }
+
+  const std::uint64_t id = GlobalIterators().Create(std::move(it));
+  auto entry = GlobalIterators().Get(id);
+  if (!entry) {
+    resp::AppendError(r.payload, "ERR failed to register iterator");
+    return r;
+  }
+
+  std::lock_guard lk(entry->mu);
+  resp::AppendArrayHeader(r.payload, 4);
+  resp::AppendInteger(r.payload, static_cast<std::int64_t>(id));
+  resp::AppendInteger(r.payload, entry->it && entry->it->Valid() ? 1 : 0);
+  if (entry->it && entry->it->Valid()) {
+    resp::AppendBulkString(r.payload, entry->it->key());
+    resp::AppendBulkString(r.payload, entry->it->value());
+  } else {
+    resp::AppendNullBulkString(r.payload);
+    resp::AppendNullBulkString(r.payload);
+  }
+  return r;
+}
+
+CommandResult CmdSeekToFirst(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)db;
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 2) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'seektofirst' command");
+    return r;
+  }
+  std::uint64_t id = 0;
+  if (!ParseUint64(args[1], &id)) {
+    resp::AppendError(r.payload, "ERR invalid iterator id");
+    return r;
+  }
+  auto entry = GlobalIterators().Get(id);
+  if (!entry) {
+    resp::AppendError(r.payload, "ERR iterator not found");
+    return r;
+  }
+  std::lock_guard lk(entry->mu);
+  if (!entry->it) {
+    resp::AppendError(r.payload, "ERR iterator not initialized");
+    return r;
+  }
+  entry->it->SeekToFirst();
+  AppendIterState(r.payload, *entry->it);
+  return r;
+}
+
+CommandResult CmdSeek(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)db;
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 3) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'seek' command");
+    return r;
+  }
+  std::uint64_t id = 0;
+  if (!ParseUint64(args[1], &id)) {
+    resp::AppendError(r.payload, "ERR invalid iterator id");
+    return r;
+  }
+  auto entry = GlobalIterators().Get(id);
+  if (!entry) {
+    resp::AppendError(r.payload, "ERR iterator not found");
+    return r;
+  }
+  std::lock_guard lk(entry->mu);
+  if (!entry->it) {
+    resp::AppendError(r.payload, "ERR iterator not initialized");
+    return r;
+  }
+  entry->it->Seek(args[2]);
+  AppendIterState(r.payload, *entry->it);
+  return r;
+}
+
+CommandResult CmdValid(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)db;
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 2) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'valid' command");
+    return r;
+  }
+  std::uint64_t id = 0;
+  if (!ParseUint64(args[1], &id)) {
+    resp::AppendError(r.payload, "ERR invalid iterator id");
+    return r;
+  }
+  auto entry = GlobalIterators().Get(id);
+  if (!entry) {
+    resp::AppendError(r.payload, "ERR iterator not found");
+    return r;
+  }
+  std::lock_guard lk(entry->mu);
+  if (!entry->it) {
+    resp::AppendError(r.payload, "ERR iterator not initialized");
+    return r;
+  }
+  resp::AppendInteger(r.payload, entry->it->Valid() ? 1 : 0);
+  return r;
+}
+
+CommandResult CmdNext(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)db;
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 2) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'next' command");
+    return r;
+  }
+  std::uint64_t id = 0;
+  if (!ParseUint64(args[1], &id)) {
+    resp::AppendError(r.payload, "ERR invalid iterator id");
+    return r;
+  }
+  auto entry = GlobalIterators().Get(id);
+  if (!entry) {
+    resp::AppendError(r.payload, "ERR iterator not found");
+    return r;
+  }
+  std::lock_guard lk(entry->mu);
+  if (!entry->it) {
+    resp::AppendError(r.payload, "ERR iterator not initialized");
+    return r;
+  }
+  entry->it->Next();
+  AppendIterState(r.payload, *entry->it);
+  return r;
+}
+
+CommandResult CmdIterDel(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)db;
+  (void)cfg;
+  CommandResult r;
+  if (args.size() != 2) {
+    resp::AppendError(r.payload, "ERR wrong number of arguments for 'iterdel' command");
+    return r;
+  }
+  std::uint64_t id = 0;
+  if (!ParseUint64(args[1], &id)) {
+    resp::AppendError(r.payload, "ERR invalid iterator id");
+    return r;
+  }
+  if (!GlobalIterators().Erase(id)) {
+    resp::AppendError(r.payload, "ERR iterator not found");
+    return r;
+  }
+  resp::AppendSimpleString(r.payload, "OK");
   return r;
 }
 
@@ -470,7 +783,17 @@ const CommandRegistry& DefaultRegistry() {
     r.Register("DECR", CommandSpec{.handler = CmdDecr, .requires_db = true});
     r.Register("INCRBY", CommandSpec{.handler = CmdIncrBy, .requires_db = true});
     r.Register("DECRBY", CommandSpec{.handler = CmdDecrBy, .requires_db = true});
-    r.Register("HIDYLAN",CommandSpec{.handler = CmdHiDylan});
+    r.Register("METRIC", CommandSpec{.handler = CmdMetric, .requires_db = true});
+    r.Register("METRICS", CommandSpec{.handler = CmdMetric, .requires_db = true});
+    r.Register("FLUSH", CommandSpec{.handler = CmdFlush, .requires_db = true});
+    r.Register("COMPACT", CommandSpec{.handler = CmdCompact, .requires_db = true});
+    r.Register("SCAN", CommandSpec{.handler = CmdScan, .requires_db = true});
+    r.Register("SEEKTOFIRST", CommandSpec{.handler = CmdSeekToFirst, .requires_db = true});
+    r.Register("SEEK", CommandSpec{.handler = CmdSeek, .requires_db = true});
+    r.Register("VALID", CommandSpec{.handler = CmdValid, .requires_db = true});
+    r.Register("NEXT", CommandSpec{.handler = CmdNext, .requires_db = true});
+    r.Register("ITERDEL", CommandSpec{.handler = CmdIterDel});
+    r.Register("HIDYLAN", CommandSpec{.handler = CmdHiDylan});
 
     return r;
   }();

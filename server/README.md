@@ -49,8 +49,27 @@ redis-cli -p 6379 GET k
 - `CLIENT SETINFO ...` (accepted; returns `OK`)
 - `CONFIG GET <pattern>` (exposes server + dkv config, e.g. `CONFIG GET *`, `CONFIG GET data-dir`)
 - `CONFIG RESETSTAT`, `CONFIG REWRITE` (returns `OK`)
+- `METRICS` / `METRIC` (returns `dkv::Metrics` as an array of key/value pairs)
+- `FLUSH` (forces `db->Flush()`)
+- `COMPACT` (forces `db->Compact()`)
 
 Unsupported commands return `-ERR unknown command`.
+
+## Iterator / Scan Commands
+
+These commands expose `dkv::DB::Iterator` over RESP for debugging and admin workflows.
+
+- `SCAN [prefix]` -> returns `[iter_id, valid, key, value]`
+- `SEEKTOFIRST <iter_id>` -> returns `[valid, key, value]`
+- `SEEK <iter_id> <target>` -> returns `[valid, key, value]`
+- `NEXT <iter_id>` -> returns `[valid, key, value]`
+- `VALID <iter_id>` -> returns `0` or `1`
+- `ITERDEL <iter_id>` -> closes the iterator (frees memory)
+
+Notes:
+
+- The iterator is a point-in-time view built when `SCAN` runs (not a live cursor).
+- `key`/`value` are returned as RESP bulk strings; if `valid=0`, both are `nil`.
 
 ## Configuration
 
