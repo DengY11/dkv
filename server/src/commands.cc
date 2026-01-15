@@ -416,6 +416,15 @@ CommandResult CmdDecrBy(const std::vector<std::string>& args, dkv::DB* db, const
   return DoIncr(args[1], -by, db);
 }
 
+CommandResult CmdHiDylan(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg) {
+  (void)args;
+  (void)db;
+  (void)cfg;
+  CommandResult r;
+  resp::AppendSimpleString(r.payload, "Hi, i am dkv author, nice to see you use dkv!!");
+  return r;
+}
+
 using Handler = CommandResult (*)(const std::vector<std::string>& args, dkv::DB* db, const ServerConfig* cfg);
 
 struct CommandSpec {
@@ -461,6 +470,7 @@ const CommandRegistry& DefaultRegistry() {
     r.Register("DECR", CommandSpec{.handler = CmdDecr, .requires_db = true});
     r.Register("INCRBY", CommandSpec{.handler = CmdIncrBy, .requires_db = true});
     r.Register("DECRBY", CommandSpec{.handler = CmdDecrBy, .requires_db = true});
+    r.Register("HIDYLAN",CommandSpec{.handler = CmdHiDylan});
 
     return r;
   }();
