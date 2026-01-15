@@ -2,23 +2,17 @@
 
 #include <atomic>
 #include <cstddef>
-#include <cstdint>
-#include <deque>
-#include <filesystem>
-#include <mutex>
-#include <optional>
+#include <memory>
 #include <string>
-#include <string_view>
-#include <thread>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include <dkv/db.h>
 
-#include "thread_pool.h"
-
 namespace dkv_server {
+
+class ThreadPool;
+class SubReactor;
+class Acceptor;
 
 struct ServerConfig {
   std::string bind{"0.0.0.0"};
@@ -41,9 +35,6 @@ class DkvServer {
  private:
   ServerConfig cfg_;
   std::unique_ptr<dkv::DB> db_;
-
-  class SubReactor;
-  class Acceptor;
 
   std::unique_ptr<ThreadPool> workers_;
   std::vector<std::unique_ptr<SubReactor>> subreactors_;

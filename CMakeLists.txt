@@ -150,9 +150,12 @@ endif()
 if(DKV_BUILD_SERVER)
   find_package(Threads REQUIRED)
   add_executable(dkv_server
+    server/src/acceptor.cc
+    server/src/commands.cc
     server/src/main.cpp
     server/src/resp.cc
-    server/src/server.cc)
+    server/src/server.cc
+    server/src/subreactor.cc)
   set_target_properties(dkv_server PROPERTIES OUTPUT_NAME dkv-server)
   target_link_libraries(dkv_server PRIVATE dkv Threads::Threads)
   if(MSVC)
