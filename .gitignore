@@ -17,3 +17,6 @@
 /.cache/
 /.vs/
 /.vscode/
+/dkv-data/
+/test-data/
+/bench-data/

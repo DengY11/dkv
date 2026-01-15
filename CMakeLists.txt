@@ -5,6 +5,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(DKV_BUILD_TESTS "Build unit tests" ON)
 option(DKV_BUILD_BENCHMARKS "Build benchmarks" ON)
+option(DKV_BUILD_SERVER "Build dkv server" ON)
+option(DKV_BUILD_UTILS "Build utility tools" ON)
+option(DKV_BUILD_EXAMPLES "Build examples" ON)
 
 include(GNUInstallDirs)
 
@@ -144,5 +147,34 @@ if(DKV_BUILD_BENCHMARKS)
   endif()
 endif()
 
-add_executable(dkv_example examples/example.cc)
-target_link_libraries(dkv_example PRIVATE dkv)
+if(DKV_BUILD_SERVER)
+  find_package(Threads REQUIRED)
+  add_executable(dkv_server
+    server/src/main.cpp
+    server/src/resp.cc
+    server/src/server.cc)
+  set_target_properties(dkv_server PROPERTIES OUTPUT_NAME dkv-server)
+  target_link_libraries(dkv_server PRIVATE dkv Threads::Threads)
+  if(MSVC)
+    target_compile_options(dkv_server PRIVATE /W4 /permissive-)
+  else()
+    target_compile_options(dkv_server PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endif()
+
+if(DKV_BUILD_UTILS)
+  add_executable(dkv_dump utils/dkv_dump.cpp)
+  set_target_properties(dkv_dump PROPERTIES OUTPUT_NAME dkv-dump)
+  target_link_libraries(dkv_dump PRIVATE dkv)
+  target_include_directories(dkv_dump PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  if(MSVC)
+    target_compile_options(dkv_dump PRIVATE /W4 /permissive-)
+  else()
+    target_compile_options(dkv_dump PRIVATE -Wall -Wextra -Wpedantic)
+  endif()
+endif()
+
+if(DKV_BUILD_EXAMPLES)
+  add_executable(dkv_example examples/example.cc)
+  target_link_libraries(dkv_example PRIVATE dkv)
+endif()

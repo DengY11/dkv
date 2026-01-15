@@ -1,6 +1,7 @@
 # dkv: a LSM-tree key-value store (C++20)
 
-An embedded, high performance LSM-tree key-value store. Ships as a static library plus tests and benchmarks.
+An embedded, high performance LSM-tree key-value store. Ships as a static library plus optional tests, benchmarks,
+server, and tools.
 
 ## Features
 - Write-ahead log for crash safety, memtable backed by sorted std::map
@@ -15,6 +16,14 @@ An embedded, high performance LSM-tree key-value store. Ships as a static librar
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
+
+To build only the `dkv` library:
+
+```bash
+cmake -S . -B build -DDKV_BUILD_SERVER=OFF -DDKV_BUILD_UTILS=OFF
+```
+
+See `server/README.md` for `dkv-server`, and `utils/dkv_dump.cpp` for `dkv-dump`.
 
 ## Quickstart
 ```cpp
