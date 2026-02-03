@@ -11,10 +11,14 @@ server, and tools.
 - Simple API for `Put`, `Get`, `Delete`, iterator-style `Scan` (with optional snapshot), `Flush`, `Compact`
 - Library-first design: `#include <dkv/db.h>` and link against `dkv`
 
-## Build & Run
+## Build & Run & Install
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++
 cmake --build build -j
+sudo cmake --install build --prefix /usr/local
+
+#run server
+./build/dkv-server
 ```
 
 ### Build Options

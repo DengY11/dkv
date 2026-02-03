@@ -33,6 +33,13 @@ set(DKV_SOURCES
   src/util.cc
   src/wal.cc)
 
+set(DKV_PUBLIC_HEADERS
+  include/dkv/db.h
+  include/dkv/filename.h
+  include/dkv/options.h
+  include/dkv/status.h
+  include/dkv/resp_client.h)
+
 add_library(dkv STATIC ${DKV_SOURCES})
 target_include_directories(dkv
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -113,7 +120,8 @@ endif()
 install(TARGETS dkv
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
   INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES ${DKV_PUBLIC_HEADERS}
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/dkv)
 
 if(DKV_BUILD_TESTS)
   enable_testing()
