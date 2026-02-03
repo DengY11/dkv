@@ -101,6 +101,74 @@ class RespClient {
     return ReadReply();
   }
 
+  RespValue Ping() { return Command({"PING"}); }
+  RespValue Ping(std::string_view message) { return Command({"PING", message}); }
+  RespValue Echo(std::string_view message) { return Command({"ECHO", message}); }
+  RespValue Quit() { return Command({"QUIT"}); }
+  RespValue Hello() { return Command({"HELLO"}); }
+  RespValue Info() { return Command({"INFO"}); }
+  RespValue CommandCommand() { return Command({"COMMAND"}); }
+  RespValue ClientSetInfo(std::string_view k, std::string_view v) { return Command({"CLIENT", "SETINFO", k, v}); }
+
+  RespValue Get(std::string_view key) { return Command({"GET", key}); }
+  RespValue Set(std::string_view key, std::string_view value) { return Command({"SET", key, value}); }
+  RespValue Del(std::initializer_list<std::string_view> keys) {
+    std::vector<std::string_view> args;
+    args.reserve(1 + keys.size());
+    args.push_back("DEL");
+    args.insert(args.end(), keys.begin(), keys.end());
+    return Command(args);
+  }
+  RespValue Exists(std::initializer_list<std::string_view> keys) {
+    std::vector<std::string_view> args;
+    args.reserve(1 + keys.size());
+    args.push_back("EXISTS");
+    args.insert(args.end(), keys.begin(), keys.end());
+    return Command(args);
+  }
+  RespValue Mget(std::initializer_list<std::string_view> keys) {
+    std::vector<std::string_view> args;
+    args.reserve(1 + keys.size());
+    args.push_back("MGET");
+    args.insert(args.end(), keys.begin(), keys.end());
+    return Command(args);
+  }
+  RespValue Mset(std::initializer_list<std::pair<std::string_view, std::string_view>> kvs) {
+    std::vector<std::string_view> args;
+    args.reserve(1 + kvs.size() * 2);
+    args.push_back("MSET");
+    for (const auto& kv : kvs) {
+      args.push_back(kv.first);
+      args.push_back(kv.second);
+    }
+    return Command(args);
+  }
+  RespValue Incr(std::string_view key) { return Command({"INCR", key}); }
+  RespValue Decr(std::string_view key) { return Command({"DECR", key}); }
+  RespValue IncrBy(std::string_view key, std::int64_t by) { return Command({"INCRBY", key, ToString(by)}); }
+  RespValue DecrBy(std::string_view key, std::int64_t by) { return Command({"DECRBY", key, ToString(by)}); }
+
+  RespValue Metrics() { return Command({"METRICS"}); }
+  RespValue Metric() { return Command({"METRIC"}); }
+  RespValue Flush() { return Command({"FLUSH"}); }
+  RespValue Compact() { return Command({"COMPACT"}); }
+
+  RespValue ConfigGet(std::string_view pattern) { return Command({"CONFIG", "GET", pattern}); }
+  RespValue ConfigResetStat() { return Command({"CONFIG", "RESETSTAT"}); }
+  RespValue ConfigRewrite() { return Command({"CONFIG", "REWRITE"}); }
+
+  RespValue Scan(std::string_view prefix = {}) {
+    if (prefix.empty()) return Command({"SCAN"});
+    return Command({"SCAN", prefix});
+  }
+  RespValue SeekToFirst(std::string_view iter_id) { return Command({"SEEKTOFIRST", iter_id}); }
+  RespValue Seek(std::string_view iter_id, std::string_view target) { return Command({"SEEK", iter_id, target}); }
+  RespValue Valid(std::string_view iter_id) { return Command({"VALID", iter_id}); }
+  RespValue Next(std::string_view iter_id) { return Command({"NEXT", iter_id}); }
+  RespValue IterDel(std::string_view iter_id) { return Command({"ITERDEL", iter_id}); }
+
+  RespValue HiDylan() { return Command({"HIDYLAN"}); }
+
   static std::string BuildCommand(std::initializer_list<std::string_view> args) {
     return BuildCommand(std::vector<std::string_view>(args.begin(), args.end()));
   }
@@ -127,6 +195,13 @@ class RespClient {
     auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value);
     (void)ec;
     out.append(buf, static_cast<std::size_t>(ptr - buf));
+  }
+
+  static std::string ToString(std::int64_t value) {
+    char buf[64];
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+    (void)ec;
+    return std::string(buf, static_cast<std::size_t>(ptr - buf));
   }
 
   [[nodiscard]] static std::int64_t ParseNumber(std::string_view text) {

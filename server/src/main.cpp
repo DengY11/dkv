@@ -5,12 +5,14 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <execinfo.h>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unistd.h>
 
 #include "server.h"
 
@@ -18,6 +20,34 @@ namespace {
 std::atomic_bool g_stop{false};
 
 void OnSignal(int) { g_stop.store(true, std::memory_order_relaxed); }
+
+void OnFatalSignal(int sig) {
+  const char* name = "unknown";
+  switch (sig) {
+    case SIGSEGV:
+      name = "SIGSEGV";
+      break;
+    case SIGABRT:
+      name = "SIGABRT";
+      break;
+    case SIGBUS:
+      name = "SIGBUS";
+      break;
+    case SIGILL:
+      name = "SIGILL";
+      break;
+    default:
+      break;
+  }
+  std::cerr << "[fatal] signal " << name << " (" << sig << ")\n";
+
+  void* frames[64];
+  int n = ::backtrace(frames, static_cast<int>(sizeof(frames) / sizeof(frames[0])));
+  if (n > 0) {
+    ::backtrace_symbols_fd(frames, n, STDERR_FILENO);
+  }
+  std::_Exit(128 + sig);
+}
 
 std::string LowerAscii(std::string_view s) {
   std::string out;
@@ -355,6 +385,14 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
+  std::signal(SIGSEGV, OnFatalSignal);
+  std::signal(SIGABRT, OnFatalSignal);
+#ifdef SIGBUS
+  std::signal(SIGBUS, OnFatalSignal);
+#endif
+#ifdef SIGILL
+  std::signal(SIGILL, OnFatalSignal);
+#endif
 
   try {
     dkv_server::DkvServer server(cfg);
