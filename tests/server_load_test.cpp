@@ -29,29 +29,34 @@ int main(int argc, char** argv) {
 
   for (int t = 0; t < threads; ++t) {
     workers.emplace_back([&, t] {
-      dkv::RespClient client(host, static_cast<std::uint16_t>(port));
-      ready.fetch_add(1, std::memory_order_relaxed);
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-      }
+      try {
+        dkv::RespClient client(host, static_cast<std::uint16_t>(port));
+        auto kv = client.kv();
+        ready.fetch_add(1, std::memory_order_relaxed);
+        while (!start.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
 
-      const int base = t * keys_per_thread;
-      for (int r = 0; r < rounds; ++r) {
-        for (int i = 0; i < keys_per_thread; ++i) {
-          std::string key = "k" + std::to_string(base + i);
-          std::string val = "v" + std::to_string(base + i);
-          auto rep = client.Set(key, val);
-          if (rep.IsError()) {
-            errors.fetch_add(1, std::memory_order_relaxed);
+        const int base = t * keys_per_thread;
+        for (int r = 0; r < rounds; ++r) {
+          for (int i = 0; i < keys_per_thread; ++i) {
+            std::string key = "k" + std::to_string(base + i);
+            std::string val = "v" + std::to_string(base + i);
+            if (!kv.SetOk(key, val)) {
+              errors.fetch_add(1, std::memory_order_relaxed);
+            }
+          }
+          for (int i = 0; i < keys_per_thread; ++i) {
+            std::string key = "k" + std::to_string(base + i);
+            std::string expect = "v" + std::to_string(base + i);
+            auto got = kv.GetString(key);
+            if (!got || *got != expect) {
+              errors.fetch_add(1, std::memory_order_relaxed);
+            }
           }
         }
-        for (int i = 0; i < keys_per_thread; ++i) {
-          std::string key = "k" + std::to_string(base + i);
-          auto rep = client.Get(key);
-          if (rep.IsError()) {
-            errors.fetch_add(1, std::memory_order_relaxed);
-          }
-        }
+      } catch (const std::exception&) {
+        errors.fetch_add(1, std::memory_order_relaxed);
       }
     });
   }
@@ -70,8 +75,12 @@ int main(int argc, char** argv) {
   auto end_ts = std::chrono::steady_clock::now();
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_ts - start_ts).count();
 
+  const std::int64_t ops = static_cast<std::int64_t>(threads) * keys_per_thread * rounds * 2;
+  const double seconds = ms / 1000.0;
+  const double ops_per_sec = seconds > 0.0 ? ops / seconds : 0.0;
   std::cout << "threads=" << threads << " keys_per_thread=" << keys_per_thread
             << " rounds=" << rounds << " elapsed_ms=" << ms
+            << " ops=" << ops << " ops_per_sec=" << ops_per_sec
             << " errors=" << errors.load() << "\n";
   return 0;
 }

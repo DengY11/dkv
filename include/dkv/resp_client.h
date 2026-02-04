@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <initializer_list>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -25,12 +26,182 @@ struct RespValue {
   std::int64_t integer{0};
   std::vector<RespValue> array;
 
+  [[nodiscard]] bool IsSimpleString() const { return type == Type::kSimpleString; }
+  [[nodiscard]] bool IsBulkString() const { return type == Type::kBulkString; }
+  [[nodiscard]] bool IsInteger() const { return type == Type::kInteger; }
+  [[nodiscard]] bool IsArray() const { return type == Type::kArray; }
+  [[nodiscard]] bool IsString() const { return IsSimpleString() || IsBulkString(); }
   [[nodiscard]] bool IsNull() const { return type == Type::kNull; }
   [[nodiscard]] bool IsError() const { return type == Type::kError; }
+  [[nodiscard]] bool IsOk() const { return IsSimpleString() && str == "OK"; }
+  [[nodiscard]] std::string_view StringView() const { return str; }
+  [[nodiscard]] std::int64_t Integer() const { return integer; }
 };
 
 class RespClient {
  public:
+  using IterId = std::int64_t;
+
+  struct IterState {
+    bool valid{false};
+    std::optional<std::string> key;
+    std::optional<std::string> value;
+  };
+
+  struct ScanResult {
+    IterId id{0};
+    IterState state;
+  };
+
+  struct Raw {
+    RespClient* c{nullptr};
+    void Send(std::initializer_list<std::string_view> args) { c->SendCommand(args); }
+    void Send(const std::vector<std::string_view>& args) { c->SendCommand(args); }
+    RespValue Read() { return c->ReadReply(); }
+    RespValue Call(std::initializer_list<std::string_view> args) { return c->Command(args); }
+    RespValue Call(const std::vector<std::string_view>& args) { return c->Command(args); }
+  };
+
+  struct Basic {
+    RespClient* c{nullptr};
+    RespValue Ping() { return c->Ping(); }
+    RespValue Ping(std::string_view message) { return c->Ping(message); }
+    std::string PingText() { return std::string(RespClient::RequireStringView(c->Ping(), "PING")); }
+    std::string PingText(std::string_view message) {
+      return std::string(RespClient::RequireStringView(c->Ping(message), "PING"));
+    }
+    RespValue Echo(std::string_view message) { return c->Echo(message); }
+    std::string EchoText(std::string_view message) {
+      return std::string(RespClient::RequireStringView(c->Echo(message), "ECHO"));
+    }
+    RespValue Quit() { return c->Quit(); }
+    bool QuitOk() { return RespClient::RequireOk(c->Quit(), "QUIT"); }
+    RespValue Hello() { return c->Hello(); }
+    RespValue Info() { return c->Info(); }
+    std::string InfoText() { return std::string(RespClient::RequireStringView(c->Info(), "INFO")); }
+    RespValue CommandList() { return c->CommandCommand(); }
+    RespValue ClientSetInfo(std::string_view k, std::string_view v) { return c->ClientSetInfo(k, v); }
+    bool ClientSetInfoOk(std::string_view k, std::string_view v) {
+      return RespClient::RequireOk(c->ClientSetInfo(k, v), "CLIENT SETINFO");
+    }
+  };
+
+  struct KV {
+    RespClient* c{nullptr};
+    RespValue Get(std::string_view key) { return c->Get(key); }
+    RespValue Set(std::string_view key, std::string_view value) { return c->Set(key, value); }
+    RespValue Del(std::initializer_list<std::string_view> keys) { return c->Del(keys); }
+    RespValue Exists(std::initializer_list<std::string_view> keys) { return c->Exists(keys); }
+    RespValue Mget(std::initializer_list<std::string_view> keys) { return c->Mget(keys); }
+    RespValue Mset(std::initializer_list<std::pair<std::string_view, std::string_view>> kvs) { return c->Mset(kvs); }
+
+    std::optional<std::string> GetString(std::string_view key) {
+      return RespClient::OptionalString(c->Get(key), "GET");
+    }
+    bool SetOk(std::string_view key, std::string_view value) { return RespClient::RequireOk(c->Set(key, value), "SET"); }
+    std::int64_t DelCount(std::initializer_list<std::string_view> keys) {
+      return RespClient::RequireInt(c->Del(keys), "DEL");
+    }
+    std::int64_t ExistsCount(std::initializer_list<std::string_view> keys) {
+      return RespClient::RequireInt(c->Exists(keys), "EXISTS");
+    }
+    std::vector<std::optional<std::string>> MgetStrings(std::initializer_list<std::string_view> keys) {
+      RespValue v = c->Mget(keys);
+      RespClient::RequireNotError(v, "MGET");
+      if (!v.IsArray()) throw std::runtime_error("MGET: expected array");
+      std::vector<std::optional<std::string>> out;
+      out.reserve(v.array.size());
+      for (const auto& item : v.array) {
+        out.push_back(RespClient::OptionalString(item, "MGET"));
+      }
+      return out;
+    }
+    bool MsetOk(std::initializer_list<std::pair<std::string_view, std::string_view>> kvs) {
+      return RespClient::RequireOk(c->Mset(kvs), "MSET");
+    }
+  };
+
+  struct Counter {
+    RespClient* c{nullptr};
+    RespValue Incr(std::string_view key) { return c->Incr(key); }
+    RespValue Decr(std::string_view key) { return c->Decr(key); }
+    RespValue IncrBy(std::string_view key, std::int64_t by) { return c->IncrBy(key, by); }
+    RespValue DecrBy(std::string_view key, std::int64_t by) { return c->DecrBy(key, by); }
+
+    std::int64_t IncrValue(std::string_view key) { return RespClient::RequireInt(c->Incr(key), "INCR"); }
+    std::int64_t DecrValue(std::string_view key) { return RespClient::RequireInt(c->Decr(key), "DECR"); }
+    std::int64_t IncrByValue(std::string_view key, std::int64_t by) {
+      return RespClient::RequireInt(c->IncrBy(key, by), "INCRBY");
+    }
+    std::int64_t DecrByValue(std::string_view key, std::int64_t by) {
+      return RespClient::RequireInt(c->DecrBy(key, by), "DECRBY");
+    }
+  };
+
+  struct Admin {
+    RespClient* c{nullptr};
+    RespValue Metrics() { return c->Metrics(); }
+    RespValue Metric() { return c->Metric(); }
+    RespValue Flush() { return c->Flush(); }
+    RespValue Compact() { return c->Compact(); }
+
+    std::vector<std::pair<std::string, std::string>> MetricsMap() {
+      return RespClient::RequireKvArray(c->Metrics(), "METRICS");
+    }
+    std::vector<std::pair<std::string, std::string>> MetricMap() {
+      return RespClient::RequireKvArray(c->Metric(), "METRIC");
+    }
+    bool FlushOk() { return RespClient::RequireOk(c->Flush(), "FLUSH"); }
+    bool CompactOk() { return RespClient::RequireOk(c->Compact(), "COMPACT"); }
+  };
+
+  struct Config {
+    RespClient* c{nullptr};
+    RespValue Get(std::string_view pattern) { return c->ConfigGet(pattern); }
+    RespValue ResetStat() { return c->ConfigResetStat(); }
+    RespValue Rewrite() { return c->ConfigRewrite(); }
+
+    std::vector<std::pair<std::string, std::string>> GetMap(std::string_view pattern) {
+      return RespClient::RequireKvArray(c->ConfigGet(pattern), "CONFIG GET");
+    }
+    bool ResetStatOk() { return RespClient::RequireOk(c->ConfigResetStat(), "CONFIG RESETSTAT"); }
+    bool RewriteOk() { return RespClient::RequireOk(c->ConfigRewrite(), "CONFIG REWRITE"); }
+  };
+
+  struct Iter {
+    RespClient* c{nullptr};
+    RespValue Scan(std::string_view prefix = {}) { return c->Scan(prefix); }
+    RespValue SeekToFirst(std::string_view iter_id) { return c->SeekToFirst(iter_id); }
+    RespValue Seek(std::string_view iter_id, std::string_view target) { return c->Seek(iter_id, target); }
+    RespValue Valid(std::string_view iter_id) { return c->Valid(iter_id); }
+    RespValue Next(std::string_view iter_id) { return c->Next(iter_id); }
+    RespValue IterDel(std::string_view iter_id) { return c->IterDel(iter_id); }
+
+    ScanResult ScanState(std::string_view prefix = {}) { return RespClient::ParseScan(c->Scan(prefix)); }
+    IterState SeekToFirstState(IterId id) { return RespClient::ParseIterState(c->SeekToFirst(ToString(id))); }
+    IterState SeekState(IterId id, std::string_view target) {
+      return RespClient::ParseIterState(c->Seek(ToString(id), target));
+    }
+    IterState NextState(IterId id) { return RespClient::ParseIterState(c->Next(ToString(id))); }
+    bool ValidBool(IterId id) { return RespClient::RequireInt(c->Valid(ToString(id)), "VALID") != 0; }
+    bool IterDelOk(IterId id) { return RespClient::RequireOk(c->IterDel(ToString(id)), "ITERDEL"); }
+  };
+
+  struct Custom {
+    RespClient* c{nullptr};
+    RespValue HiDylan() { return c->HiDylan(); }
+    std::string HiDylanText() { return std::string(RespClient::RequireStringView(c->HiDylan(), "HIDYLAN")); }
+  };
+
+  Raw raw() { return Raw{this}; }
+  Basic basic() { return Basic{this}; }
+  KV kv() { return KV{this}; }
+  Counter counter() { return Counter{this}; }
+  Admin admin() { return Admin{this}; }
+  Config config() { return Config{this}; }
+  Iter iter() { return Iter{this}; }
+  Custom custom() { return Custom{this}; }
+
   RespClient() = default;
   RespClient(std::string_view host, std::uint16_t port) { Connect(host, port); }
   RespClient(const RespClient&) = delete;
@@ -190,6 +361,69 @@ class RespClient {
   }
 
  private:
+  static void RequireNotError(const RespValue& v, std::string_view ctx) {
+    if (v.IsError()) throw std::runtime_error(std::string(ctx) + ": " + v.str);
+  }
+
+  static bool RequireOk(const RespValue& v, std::string_view ctx) {
+    RequireNotError(v, ctx);
+    return v.IsOk();
+  }
+
+  static std::string_view RequireStringView(const RespValue& v, std::string_view ctx) {
+    RequireNotError(v, ctx);
+    if (!v.IsString()) throw std::runtime_error(std::string(ctx) + ": expected string");
+    return v.str;
+  }
+
+  static std::optional<std::string> OptionalString(const RespValue& v, std::string_view ctx) {
+    RequireNotError(v, ctx);
+    if (v.IsNull()) return std::nullopt;
+    if (!v.IsString()) throw std::runtime_error(std::string(ctx) + ": expected string or null");
+    return v.str;
+  }
+
+  static std::int64_t RequireInt(const RespValue& v, std::string_view ctx) {
+    RequireNotError(v, ctx);
+    if (!v.IsInteger()) throw std::runtime_error(std::string(ctx) + ": expected integer");
+    return v.integer;
+  }
+
+  static std::vector<std::pair<std::string, std::string>> RequireKvArray(const RespValue& v, std::string_view ctx) {
+    RequireNotError(v, ctx);
+    if (!v.IsArray()) throw std::runtime_error(std::string(ctx) + ": expected array");
+    if ((v.array.size() % 2) != 0) throw std::runtime_error(std::string(ctx) + ": expected even-sized array");
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(v.array.size() / 2);
+    for (std::size_t i = 0; i < v.array.size(); i += 2) {
+      auto key = RequireStringView(v.array[i], ctx);
+      auto val = OptionalString(v.array[i + 1], ctx);
+      out.emplace_back(std::string(key), val ? *val : std::string());
+    }
+    return out;
+  }
+
+  static IterState ParseIterState(const RespValue& v) {
+    RequireNotError(v, "ITER");
+    if (!v.IsArray() || v.array.size() != 3) throw std::runtime_error("ITER: expected array[3]");
+    IterState out;
+    out.valid = RequireInt(v.array[0], "ITER") != 0;
+    out.key = OptionalString(v.array[1], "ITER");
+    out.value = OptionalString(v.array[2], "ITER");
+    return out;
+  }
+
+  static ScanResult ParseScan(const RespValue& v) {
+    RequireNotError(v, "SCAN");
+    if (!v.IsArray() || v.array.size() != 4) throw std::runtime_error("SCAN: expected array[4]");
+    ScanResult out;
+    out.id = RequireInt(v.array[0], "SCAN");
+    out.state.valid = RequireInt(v.array[1], "SCAN") != 0;
+    out.state.key = OptionalString(v.array[2], "SCAN");
+    out.state.value = OptionalString(v.array[3], "SCAN");
+    return out;
+  }
+
   static void AppendNumber(std::string& out, std::int64_t value) {
     char buf[64];
     auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value);
