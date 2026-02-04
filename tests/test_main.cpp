@@ -1,4 +1,5 @@
 #include <cassert>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -6,6 +7,7 @@
 #include <iostream>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -676,6 +678,111 @@ bool TestFuzzWithReopen() {
   return true;
 }
 
+bool TestConcurrentReadWrite() {
+  auto dir = TempDir("dkv-concurrent");
+  dkv::Options opts;
+  opts.data_dir = dir;
+  opts.memtable_soft_limit_bytes = 64 * 1024;
+  opts.sstable_target_size_bytes = 128 * 1024;
+  opts.level0_file_limit = 2;
+  opts.flush_thread_count = 2;
+  opts.compaction_thread_count = 2;
+
+  std::unique_ptr<dkv::DB> db;
+  if (!ExpectOk(dkv::DB::Open(opts, db), "open db concurrent")) return false;
+
+  const int kThreads = 16;
+  const int kPerThread = 2000;
+  std::atomic<bool> start{false};
+  std::atomic<int> ready{0};
+  std::atomic<int> errors{0};
+
+  auto worker = [&](int tid) {
+    ready.fetch_add(1, std::memory_order_relaxed);
+    while (!start.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+
+    dkv::WriteOptions wopts;
+    dkv::ReadOptions ropts;
+    for (int i = 0; i < kPerThread; ++i) {
+      std::string key = "t" + std::to_string(tid) + ":" + std::to_string(i);
+      std::string val = "v" + std::to_string(tid) + ":" + std::to_string(i);
+      auto s = db->Put(wopts, key, val);
+      if (!s.ok()) {
+        errors.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+      if ((i & 0xFF) == 0) {
+        std::string got;
+        auto gs = db->Get(ropts, key, got);
+        if (!gs.ok() || got != val) {
+          errors.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+    }
+
+    for (int i = 0; i < kPerThread; ++i) {
+      std::string key = "t" + std::to_string(tid) + ":" + std::to_string(i);
+      std::string expect = "v" + std::to_string(tid) + ":" + std::to_string(i);
+      std::string got;
+      auto gs = db->Get(ropts, key, got);
+      if (!gs.ok() || got != expect) {
+        errors.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  };
+
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (int t = 0; t < kThreads; ++t) threads.emplace_back(worker, t);
+  while (ready.load(std::memory_order_relaxed) != kThreads) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& t : threads) t.join();
+
+  if (errors.load(std::memory_order_relaxed) != 0) {
+    std::cerr << "concurrent errors: " << errors.load() << "\n";
+    db.reset();
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  if (!ExpectOk(db->Flush(), "flush after concurrent")) {
+    db.reset();
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+  db.reset();
+
+  std::unique_ptr<dkv::DB> db2;
+  if (!ExpectOk(dkv::DB::Open(opts, db2), "reopen after concurrent")) {
+    std::filesystem::remove_all(dir);
+    return false;
+  }
+
+  dkv::ReadOptions ropts;
+  for (int t = 0; t < kThreads; ++t) {
+    for (int i = 0; i < kPerThread; ++i) {
+      std::string key = "t" + std::to_string(t) + ":" + std::to_string(i);
+      std::string expect = "v" + std::to_string(t) + ":" + std::to_string(i);
+      std::string got;
+      auto gs = db2->Get(ropts, key, got);
+      if (!gs.ok() || got != expect) {
+        std::cerr << "reopen mismatch key=" << key << " got=" << got << " status=" << gs.ToString() << "\n";
+        db2.reset();
+        std::filesystem::remove_all(dir);
+        return false;
+      }
+    }
+  }
+
+  db2.reset();
+  std::filesystem::remove_all(dir);
+  return true;
+}
+
 }  // namespace
 
 int main() {
@@ -691,6 +798,7 @@ int main() {
   ok &= TestBatchWrite();
   ok &= TestFuzzAgainstModel();
   ok &= TestFuzzWithReopen();
+  ok &= TestConcurrentReadWrite();
   if (!ok) {
     std::cerr << "Tests failed\n";
     return 1;

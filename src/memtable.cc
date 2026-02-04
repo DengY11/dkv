@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -248,7 +249,7 @@ struct MemTable::Impl {
 
   std::unique_ptr<Arena> arena;
   std::unique_ptr<SkipList> list;
-  std::mutex write_mu;
+  std::shared_mutex mu;
 };
 
 MemTable::MemTable(std::size_t approx_capacity_bytes) : impl_(std::make_unique<Impl>(approx_capacity_bytes)) {}
@@ -256,18 +257,19 @@ MemTable::MemTable(std::size_t approx_capacity_bytes) : impl_(std::make_unique<I
 MemTable::~MemTable() = default;
 
 Status MemTable::Put(std::uint64_t seq, std::string_view key, std::string_view value) {
-  std::lock_guard<std::mutex> lk(impl_->write_mu);
+  std::unique_lock<std::shared_mutex> lk(impl_->mu);
   impl_->list->Insert(key, value, seq, false);
   return Status::OK();
 }
 
 Status MemTable::Delete(std::uint64_t seq, std::string_view key) {
-  std::lock_guard<std::mutex> lk(impl_->write_mu);
+  std::unique_lock<std::shared_mutex> lk(impl_->mu);
   impl_->list->Insert(key, std::string_view{}, seq, true);
   return Status::OK();
 }
 
 bool MemTable::Get(std::string_view key, MemEntry& entry) const {
+  std::shared_lock<std::shared_mutex> lk(impl_->mu);
   return impl_->list->GetLatest(key, entry);
 }
 
@@ -283,6 +285,7 @@ std::vector<MemEntry> MemTable::Snapshot() const {
 
 std::vector<MemEntryView> MemTable::SnapshotViews() const {
   std::vector<MemEntryView> out;
+  std::shared_lock<std::shared_mutex> lk(impl_->mu);
   impl_->list->SnapshotViews(out);
   return out;
 }

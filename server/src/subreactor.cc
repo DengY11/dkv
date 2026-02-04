@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <deque>
 #include <iostream>
-#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -18,6 +17,7 @@
 #include <vector>
 
 #include "commands.h"
+#include "mpmc_queue.h"
 #include "resp.h"
 #include "thread_pool.h"
 #include "util.h"
@@ -40,7 +40,12 @@ struct ResponseMsg {
 
 struct SubReactor::Impl {
   Impl(std::size_t index, dkv::DB* db, const ServerConfig* cfg, ThreadPool* workers)
-      : index_(index), db_(db), cfg_(cfg), workers_(workers) {}
+      : index_(index),
+        db_(db),
+        cfg_(cfg),
+        workers_(workers),
+        pending_new_(kPendingNewCap),
+        pending_resp_(kPendingRespCap) {}
 
   void Start() { thread_ = std::thread([this] { Loop(); }); }
 
@@ -51,9 +56,9 @@ struct SubReactor::Impl {
   }
 
   void EnqueueNewConn(int fd) {
-    {
-      std::lock_guard lk(mu_);
-      pending_new_.push_back(fd);
+    while (!pending_new_.Enqueue(fd)) {
+      if (stopping_.load(std::memory_order_relaxed)) return;
+      std::this_thread::yield();
     }
     Notify();
   }
@@ -71,9 +76,9 @@ struct SubReactor::Impl {
   };
 
   void EnqueueResponse(ResponseMsg msg) {
-    {
-      std::lock_guard lk(mu_);
-      pending_resp_.push_back(std::move(msg));
+    while (!pending_resp_.Enqueue(std::move(msg))) {
+      if (stopping_.load(std::memory_order_relaxed)) return;
+      std::this_thread::yield();
     }
     Notify();
   }
@@ -159,15 +164,14 @@ struct SubReactor::Impl {
   }
 
   void ProcessPending() {
-    std::vector<int> new_fds;
-    std::vector<ResponseMsg> resps;
-    {
-      std::lock_guard lk(mu_);
-      if (!pending_new_.empty()) new_fds.swap(pending_new_);
-      if (!pending_resp_.empty()) resps.swap(pending_resp_);
+    int fd = -1;
+    while (pending_new_.TryDequeue(fd)) {
+      AddConn(fd);
     }
-    for (int fd : new_fds) AddConn(fd);
-    for (auto& msg : resps) ApplyResponse(msg);
+    ResponseMsg msg;
+    while (pending_resp_.TryDequeue(msg)) {
+      ApplyResponse(msg);
+    }
   }
 
   void AddConn(int fd) {
@@ -283,19 +287,30 @@ struct SubReactor::Impl {
     if (!workers_) return;
 
     c.in_flight = true;
-    std::vector<std::string> cmd = std::move(c.queue.front());
-    c.queue.pop_front();
+    constexpr std::size_t kMaxBatch = 8;
+    const std::size_t batch_n = std::min<std::size_t>(kMaxBatch, c.queue.size());
+    std::vector<std::vector<std::string>> batch;
+    batch.reserve(batch_n);
+    for (std::size_t i = 0; i < batch_n; ++i) {
+      batch.push_back(std::move(c.queue.front()));
+      c.queue.pop_front();
+    }
     ConnToken token = c.token;
     dkv::DB* db = db_;
     const ServerConfig* cfg = cfg_;
     Impl* self = this;
 
-    workers_->Submit([self, token, db, cfg, cmd = std::move(cmd)]() mutable {
-      CommandResult cr = ExecuteCommand(cmd, db, cfg);
+    workers_->Submit([self, token, db, cfg, batch = std::move(batch)]() mutable {
       ResponseMsg msg;
       msg.token = token;
-      msg.payload = std::move(cr.payload);
-      msg.close_after = cr.close_after;
+      for (auto& cmd : batch) {
+        CommandResult cr = ExecuteCommand(cmd, db, cfg);
+        msg.payload.append(cr.payload);
+        if (cr.close_after) {
+          msg.close_after = true;
+          break;
+        }
+      }
       self->EnqueueResponse(std::move(msg));
     });
   }
@@ -311,9 +326,10 @@ struct SubReactor::Impl {
   UniqueFd event_fd_;
   UniqueFd epoll_fd_;
 
-  std::mutex mu_;
-  std::vector<int> pending_new_;
-  std::vector<ResponseMsg> pending_resp_;
+  static constexpr std::size_t kPendingNewCap = 4096;
+  static constexpr std::size_t kPendingRespCap = 16384;
+  MpmcQueue<int> pending_new_;
+  MpmcQueue<ResponseMsg> pending_resp_;
 
   std::unordered_map<int, Connection> conns_;
   std::uint64_t next_conn_id_{0};

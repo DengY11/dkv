@@ -26,10 +26,14 @@ void DkvServer::Start() {
     if (!s.ok()) throw std::runtime_error("dkv::DB::Open failed: " + s.ToString());
     db_ = std::move(db);
 
+    const std::size_t hc = std::max<std::size_t>(1, std::thread::hardware_concurrency());
     std::size_t sub_n = cfg_.subreactors;
-    if (sub_n == 0) sub_n = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    if (sub_n == 0) sub_n = hc;
     std::size_t worker_n = cfg_.workers;
-    if (worker_n == 0) worker_n = std::max<std::size_t>(1, std::thread::hardware_concurrency());
+    if (worker_n == 0) worker_n = hc;
+
+    if (sub_n > hc) sub_n = hc;
+    if (worker_n > hc) worker_n = hc;
     cfg_.subreactors = sub_n;
     cfg_.workers = worker_n;
 

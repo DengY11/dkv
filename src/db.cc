@@ -51,7 +51,7 @@ class DB::Impl {
         data_dir_(options_.data_dir),
         wal_path_(data_dir_ / std::string(kWalActiveName)),
         sst_dir_(data_dir_ / "sst"),
-        mem_(std::make_unique<MemTable>(options_.memtable_soft_limit_bytes)) {}
+        mem_(std::make_shared<MemTable>(options_.memtable_soft_limit_bytes)) {}
   ~Impl();
 
   Status Init();
@@ -87,7 +87,7 @@ class DB::Impl {
   void FlushThreadLoop();
   void ApplyThreadLoop();
   void CompactThreadLoop();
-  void EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
+  void EnqueueImmutable(std::shared_ptr<MemTable> mem, std::uint64_t max_seq, std::filesystem::path wal_path);
   Status FlushImmutable(const std::shared_ptr<ImmutableMem>& imm);
   Status BuildMergedView(std::vector<std::pair<std::string, std::string>>& out, std::string_view prefix,
                          std::uint64_t snapshot_seq);
@@ -107,9 +107,9 @@ class DB::Impl {
   std::filesystem::path sst_dir_;
 
   std::unique_ptr<WAL> wal_;
-  std::unique_ptr<MemTable> mem_;
+  std::shared_ptr<MemTable> mem_;
   struct ImmutableMem {
-    std::unique_ptr<MemTable> mem;
+    std::shared_ptr<MemTable> mem;
     std::filesystem::path wal_path;
     std::uint64_t max_seq{0};
     bool flushing{false};
@@ -238,15 +238,16 @@ Status DB::Impl::Init() {
             [](const auto& a, const auto& b) { return a.first < b.first; });
 
   std::uint64_t max_seq_seen = 0;
+  auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
   for (const auto& seg : wal_segments) {
     WAL reader(seg.second, options_.sync_wal, options_.enable_crc);
-    Status rs = reader.Replay([this, &max_seq_seen](std::uint64_t seq, bool deleted, std::string&& key,
+    Status rs = reader.Replay([this, &max_seq_seen, mem](std::uint64_t seq, bool deleted, std::string&& key,
                                                     std::string&& value) {
       max_seq_seen = std::max(max_seq_seen, seq);
       if (deleted) {
-        mem_->Delete(seq, key);
+        mem->Delete(seq, key);
       } else {
-        mem_->Put(seq, key, value);
+        mem->Put(seq, key, value);
       }
     });
     if (!rs.ok()) return rs;
@@ -378,24 +379,26 @@ Status DB::Impl::LoadSSTables() {
 Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string value) {
   std::shared_lock shared(mu_);
   metrics_.puts.fetch_add(1, std::memory_order_relaxed);
+  auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
   const std::uint64_t seq = next_seq_.fetch_add(1, std::memory_order_relaxed);
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendPut(seq, key, value, sync_now);
   if (!s.ok()) return s;
-  s = mem_->Put(seq, key, value);
+  s = mem->Put(seq, key, value);
   if (!s.ok()) return s;
   if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
-  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
+  bool need_rotate = mem->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
   shared.unlock();
   if (need_rotate) {
     std::unique_lock lk(mu_);
-    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-      auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
+    auto cur_mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
+    if (cur_mem->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
+      auto new_mem = std::make_shared<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
-      EnqueueImmutable(std::move(imm_mem), seq, rotated);
+      EnqueueImmutable(cur_mem, seq, rotated);
+      std::atomic_store_explicit(&mem_, std::move(new_mem), std::memory_order_release);
     }
   }
   return Status::OK();
@@ -404,24 +407,26 @@ Status DB::Impl::Put(const WriteOptions& options, std::string key, std::string v
 Status DB::Impl::Delete(const WriteOptions& options, std::string key) {
   std::shared_lock shared(mu_);
   metrics_.deletes.fetch_add(1, std::memory_order_relaxed);
+  auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
   const std::uint64_t seq = next_seq_.fetch_add(1, std::memory_order_relaxed);
   const bool sync_now = options.sync || options_.sync_wal;
   Status s = wal_->AppendDelete(seq, key, sync_now);
   if (!s.ok()) return s;
-  s = mem_->Delete(seq, key);
+  s = mem->Delete(seq, key);
   if (!s.ok()) return s;
   if (sync_now) metrics_.wal_syncs.fetch_add(1, std::memory_order_relaxed);
-  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
+  bool need_rotate = mem->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
   shared.unlock();
   if (need_rotate) {
     std::unique_lock lk(mu_);
-    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-      auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
+    auto cur_mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
+    if (cur_mem->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
+      auto new_mem = std::make_shared<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       s = RotateWalLocked(seq, rotated);
       if (!s.ok()) return s;
-      EnqueueImmutable(std::move(imm_mem), seq, rotated);
+      EnqueueImmutable(cur_mem, seq, rotated);
+      std::atomic_store_explicit(&mem_, std::move(new_mem), std::memory_order_release);
     }
   }
   return Status::OK();
@@ -431,6 +436,7 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
   if (batch.empty()) return Status::OK();
   std::shared_lock shared(mu_);
   metrics_.batches.fetch_add(1, std::memory_order_relaxed);
+  auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
   std::vector<std::uint64_t> seqs;
   seqs.reserve(batch.ops().size());
 
@@ -445,11 +451,11 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
     if (op.type == BatchOp::Type::kPut) {
       s = wal_->AppendPut(seq, op.key, op.value, /*sync=*/false);
       if (!s.ok()) return s;
-      s = mem_->Put(seq, op.key, op.value);
+      s = mem->Put(seq, op.key, op.value);
     } else {
       s = wal_->AppendDelete(seq, op.key, /*sync=*/false);
       if (!s.ok()) return s;
-      s = mem_->Delete(seq, op.key);
+      s = mem->Delete(seq, op.key);
     }
     if (!s.ok()) return s;
   }
@@ -461,17 +467,18 @@ Status DB::Impl::Write(const WriteOptions& options, const WriteBatch& batch) {
     if (!s.ok()) return s;
   }
 
-  bool need_rotate = mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
+  bool need_rotate = mem->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes;
   shared.unlock();
   if (need_rotate) {
     std::unique_lock lk(mu_);
-    if (mem_->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
-      auto imm_mem = std::move(mem_);
-      mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
+    auto cur_mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
+    if (cur_mem->ApproximateMemoryUsage() >= options_.memtable_soft_limit_bytes) {
+      auto new_mem = std::make_shared<MemTable>(options_.memtable_soft_limit_bytes);
       std::filesystem::path rotated;
       Status s = RotateWalLocked(seqs.back(), rotated);
       if (!s.ok()) return s;
-      EnqueueImmutable(std::move(imm_mem), seqs.back(), rotated);
+      EnqueueImmutable(cur_mem, seqs.back(), rotated);
+      std::atomic_store_explicit(&mem_, std::move(new_mem), std::memory_order_release);
     }
   }
   return Status::OK();
@@ -481,7 +488,8 @@ Status DB::Impl::Get(const ReadOptions& /*options*/, std::string_view key, std::
   metrics_.gets.fetch_add(1, std::memory_order_relaxed);
   // Check memtable first (newest).
   MemEntry entry;
-  if (mem_->Get(key, entry)) {
+  auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
+  if (mem && mem->Get(key, entry)) {
     if (entry.deleted) return Status::NotFound("deleted");
     value = entry.value;
     return Status::OK();
@@ -534,23 +542,20 @@ Status DB::Impl::BuildMergedView(std::vector<std::pair<std::string, std::string>
   std::vector<Cursor> cursors;
   // Active memtable and immutables: iterate directly over skip list nodes.
   {
-    std::shared_lock mu_lk(mu_);
-    {
-      auto it = mem_->NewIterator();
-      cursors.push_back(Cursor{[cur = it, snapshot_seq](MemEntry& out) mutable {
-        while (cur.Valid()) {
-          auto v = cur.view();
-          cur.Next();
-          if (v.seq > snapshot_seq) continue;
-          out.key = std::string(v.key);
-          out.value = std::string(v.value);
-          out.seq = v.seq;
-          out.deleted = v.deleted;
-          return true;
-        }
-        return false;
-      }});
-    }
+    auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
+    auto views = mem ? mem->SnapshotViews() : std::vector<MemEntryView>{};
+    cursors.push_back(Cursor{[views = std::move(views), idx = std::size_t{0}, snapshot_seq](MemEntry& out) mutable {
+      while (idx < views.size()) {
+        const auto& v = views[idx++];
+        if (v.seq > snapshot_seq) continue;
+        out.key = std::string(v.key);
+        out.value = std::string(v.value);
+        out.seq = v.seq;
+        out.deleted = v.deleted;
+        return true;
+      }
+      return false;
+    }});
     std::lock_guard lk(flush_mu_);
     for (auto it = immutables_.rbegin(); it != immutables_.rend(); ++it) {
       if (!(*it) || !(*it)->mem) continue;
@@ -707,16 +712,17 @@ Status DB::Impl::Flush() {
 }
 
 Status DB::Impl::FlushLocked() {
-  if (mem_->Empty() && immutables_.empty()) return Status::OK();
-  if (!mem_->Empty()) {
-    auto imm_mem = std::move(mem_);
-    mem_ = std::make_unique<MemTable>(options_.memtable_soft_limit_bytes);
+  auto mem = std::atomic_load_explicit(&mem_, std::memory_order_acquire);
+  if (mem && mem->Empty() && immutables_.empty()) return Status::OK();
+  if (mem && !mem->Empty()) {
+    auto new_mem = std::make_shared<MemTable>(options_.memtable_soft_limit_bytes);
     std::filesystem::path rotated;
     auto cur = next_seq_.load(std::memory_order_relaxed);
     std::uint64_t max_seq = cur ? cur - 1 : 0;
     Status s = RotateWalLocked(max_seq, rotated);
     if (!s.ok()) return s;
-    EnqueueImmutable(std::move(imm_mem), max_seq, rotated);
+    EnqueueImmutable(mem, max_seq, rotated);
+    std::atomic_store_explicit(&mem_, std::move(new_mem), std::memory_order_release);
   }
   std::unique_lock lk(flush_mu_);
   flush_cv_.wait(lk, [this] {
@@ -949,7 +955,7 @@ Status DB::Impl::RotateWalLocked(std::uint64_t max_seq_for_old, std::filesystem:
   return wal_->Open();
 }
 
-void DB::Impl::EnqueueImmutable(std::unique_ptr<MemTable> mem, std::uint64_t max_seq,
+void DB::Impl::EnqueueImmutable(std::shared_ptr<MemTable> mem, std::uint64_t max_seq,
                                 std::filesystem::path wal_path) {
   {
     std::unique_lock lk(flush_mu_);
