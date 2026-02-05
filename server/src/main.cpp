@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "server.h"
+#include "log.h"
 
 namespace {
 std::atomic_bool g_stop{false};
@@ -48,6 +49,11 @@ void OnFatalSignal(int sig) {
   }
   std::_Exit(128 + sig);
 }
+
+struct LogScope {
+  LogScope() { dkv_server::AsyncLogger::Instance().Start(); }
+  ~LogScope() { dkv_server::AsyncLogger::Instance().Stop(); }
+};
 
 std::string LowerAscii(std::string_view s) {
   std::string out;
@@ -122,6 +128,7 @@ void PrintUsage(const char* prog) {
   std::cerr << "  --port <port>                (default: 6379)\n";
   std::cerr << "  --subreactors <n>             (0 = auto)\n";
   std::cerr << "  --workers <n>                 (0 = auto)\n\n";
+  std::cerr << "  --log-new-conn [true|false]   (default: false)\n";
   std::cerr << "DKV options (mirrors include/dkv/options.h):\n";
   std::cerr << "  --data-dir <path>                         (default: dkv-data)\n";
   std::cerr << "  --memtable-soft-limit-bytes <bytes>       (*-bytes supports K/M/G suffix)\n";
@@ -226,7 +233,6 @@ ParseOutcome ParseArgs(int argc, char** argv, dkv_server::ServerConfig* cfg, std
       cfg->workers = static_cast<std::size_t>(n);
       continue;
     }
-
     auto set_bytes = [&](std::size_t* field, std::string_view opt_name) -> ParseOutcome {
       auto v = require_value();
       if (!v) return fail(std::string(opt_name) + " requires a value");
@@ -258,6 +264,12 @@ ParseOutcome ParseArgs(int argc, char** argv, dkv_server::ServerConfig* cfg, std
       }
       return ParseOutcome::kOk;
     };
+
+    if (key == "--log-new-conn") {
+      auto r = set_bool(&cfg->log_new_conn);
+      if (r != ParseOutcome::kOk) return r;
+      continue;
+    }
 
     if (key == "--data-dir") {
       auto v = require_value();
@@ -383,6 +395,8 @@ int main(int argc, char** argv) {
       return 1;
   }
 
+  LogScope log_scope;
+
   std::signal(SIGINT, OnSignal);
   std::signal(SIGTERM, OnSignal);
   std::signal(SIGSEGV, OnFatalSignal);
@@ -403,7 +417,7 @@ int main(int argc, char** argv) {
     server.Stop();
     return 0;
   } catch (const std::exception& ex) {
-    std::cerr << "fatal: " << ex.what() << "\n";
+    dkv_server::LogError(std::string("fatal: ") + ex.what());
     return 1;
   }
 }

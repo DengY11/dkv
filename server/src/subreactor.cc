@@ -8,7 +8,6 @@
 #include <cerrno>
 #include <cstdint>
 #include <deque>
-#include <iostream>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -17,6 +16,7 @@
 #include <vector>
 
 #include "commands.h"
+#include "log.h"
 #include "mpmc_queue.h"
 #include "resp.h"
 #include "thread_pool.h"
@@ -149,7 +149,7 @@ struct SubReactor::Impl {
       }
       conns_.clear();
     } catch (const std::exception& ex) {
-      std::cerr << "[subreactor " << index_ << "] fatal: " << ex.what() << "\n";
+      LogError(std::string("[subreactor ") + std::to_string(index_) + "] fatal: " + ex.what());
     }
   }
 

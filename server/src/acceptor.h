@@ -10,7 +10,7 @@ class SubReactor;
 
 class Acceptor {
  public:
-  Acceptor(std::string bind, int port, std::vector<SubReactor*> subs);
+  Acceptor(std::string bind, int port, std::vector<SubReactor*> subs, bool log_new_conn);
   Acceptor(const Acceptor&) = delete;
   Acceptor& operator=(const Acceptor&) = delete;
   ~Acceptor();
@@ -24,4 +24,3 @@ class Acceptor {
 };
 
 }  // namespace dkv_server
-

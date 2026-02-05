@@ -8,7 +8,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
-#include <iostream>
+#include <netdb.h>
 #include <system_error>
 #include <stdexcept>
 #include <string>
@@ -17,12 +17,14 @@
 #include <vector>
 
 #include "subreactor.h"
+#include "log.h"
 #include "util.h"
 
 namespace dkv_server {
 
 struct Acceptor::Impl {
-  Impl(std::string bind, int port, std::vector<SubReactor*> subs) : bind_(std::move(bind)), port_(port), subs_(std::move(subs)) {}
+  Impl(std::string bind, int port, std::vector<SubReactor*> subs, bool log_new_conn)
+      : bind_(std::move(bind)), port_(port), subs_(std::move(subs)), log_new_conn_(log_new_conn) {}
 
   void Start() {
     Setup();
@@ -79,13 +81,15 @@ struct Acceptor::Impl {
         }
       }
     } catch (const std::exception& ex) {
-      std::cerr << "[acceptor] fatal: " << ex.what() << "\n";
+      LogError(std::string("[acceptor] fatal: ") + ex.what());
     }
   }
 
   void AcceptLoop() {
     for (;;) {
-      int fd = ::accept4(listen_fd_.get(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+      sockaddr_storage addr{};
+      socklen_t addr_len = sizeof(addr);
+      int fd = ::accept4(listen_fd_.get(), reinterpret_cast<sockaddr*>(&addr), &addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
       if (fd >= 0) {
         try {
           SetTcpNoDelay(fd);
@@ -93,6 +97,16 @@ struct Acceptor::Impl {
         } catch (...) {
           ::close(fd);
           continue;
+        }
+        if (log_new_conn_) {
+          char host[NI_MAXHOST];
+          char serv[NI_MAXSERV];
+          if (::getnameinfo(reinterpret_cast<sockaddr*>(&addr), addr_len, host, sizeof(host), serv, sizeof(serv),
+                            NI_NUMERICHOST | NI_NUMERICSERV) == 0) {
+            LogInfo(std::string("accept ") + host + ":" + serv + " fd=" + std::to_string(fd));
+          } else {
+            LogInfo(std::string("accept fd=") + std::to_string(fd));
+          }
         }
         if (subs_.empty()) {
           ::close(fd);
@@ -116,10 +130,11 @@ struct Acceptor::Impl {
   std::thread thread_;
   UniqueFd listen_fd_;
   UniqueFd epoll_fd_;
+  bool log_new_conn_{false};
 };
 
-Acceptor::Acceptor(std::string bind, int port, std::vector<SubReactor*> subs)
-    : impl_(std::make_unique<Impl>(std::move(bind), port, std::move(subs))) {}
+Acceptor::Acceptor(std::string bind, int port, std::vector<SubReactor*> subs, bool log_new_conn)
+    : impl_(std::make_unique<Impl>(std::move(bind), port, std::move(subs), log_new_conn)) {}
 
 Acceptor::~Acceptor() { Stop(); }
 

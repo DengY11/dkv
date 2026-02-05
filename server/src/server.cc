@@ -1,12 +1,13 @@
 #include "server.h"
 
 #include <algorithm>
-#include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <utility>
 
 #include "acceptor.h"
+#include "log.h"
 #include "subreactor.h"
 #include "thread_pool.h"
 
@@ -47,11 +48,13 @@ void DkvServer::Start() {
     }
     for (auto& sr : subreactors_) sr->Start();
 
-    acceptor_ = std::make_unique<Acceptor>(cfg_.bind, cfg_.port, std::move(subs_raw));
+    acceptor_ = std::make_unique<Acceptor>(cfg_.bind, cfg_.port, std::move(subs_raw), cfg_.log_new_conn);
     acceptor_->Start();
 
-    std::cout << "dkv-server listening on " << cfg_.bind << ":" << cfg_.port << " (subreactors=" << sub_n
-              << ", workers=" << worker_n << ", data_dir=" << cfg_.dkv_options.data_dir.string() << ")\n";
+    std::ostringstream oss;
+    oss << "dkv-server listening on " << cfg_.bind << ":" << cfg_.port << " (subreactors=" << sub_n
+        << ", workers=" << worker_n << ", data_dir=" << cfg_.dkv_options.data_dir.string() << ")";
+    LogInfo(oss.str());
   } catch (...) {
     Stop();
     throw;

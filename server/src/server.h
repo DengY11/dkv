@@ -19,6 +19,7 @@ struct ServerConfig {
   int port{6379};
   std::size_t subreactors{0};
   std::size_t workers{0};
+  bool log_new_conn{false};
   dkv::Options dkv_options{};
 };
 

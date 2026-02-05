@@ -161,6 +161,7 @@ endif()
 if(DKV_BUILD_SERVER)
   find_package(Threads REQUIRED)
   add_executable(dkv_server
+    server/src/log.cc
     server/src/acceptor.cc
     server/src/commands.cc
     server/src/main.cpp

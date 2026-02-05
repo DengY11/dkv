@@ -1,71 +1,69 @@
-# dkv: a LSM-tree key-value store (C++20)
+# dkv (C++20)
 
-An embedded, high performance LSM-tree key-value store. Ships as a static library plus optional tests, benchmarks,
-server, and tools.
+An embedded LSM-tree key-value store with an optional RESP server.
 
-## Features
-- Write-ahead log for crash safety, memtable backed by sorted std::map
-- SSTables with block index + Bloom filter for faster reads
-- Level-0 fan-in with leveled compaction to deeper levels; file sizes bounded by `sstable_target_size_bytes`
-- Batched writes via `WriteBatch` to amortize WAL fsyncs
-- Simple API for `Put`, `Get`, `Delete`, iterator-style `Scan` (with optional snapshot), `Flush`, `Compact`
-- Library-first design: `#include <dkv/db.h>` and link against `dkv`
+## Highlights
+- WAL + MANIFEST for durability/recovery
+- Memtable (skiplist + arena) with background flush pipeline
+- SSTables with block index + Bloom filters, optional compression
+- Block cache + raw block cache
+- Background flush/compaction threads
+- RESP server (Redis protocol subset) + header-only client
 
-## Build & Run & Install
+## Build & Install
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 sudo cmake --install build --prefix /usr/local
-
-#run server
-./build/dkv-server
 ```
 
-### Build Options
+## Usage
 
-This repo can build multiple targets. You can turn them on/off at configure time:
-
-- `DKV_BUILD_SERVER` (default `ON`): build `dkv-server`
-- `DKV_BUILD_UTILS` (default `ON`): build `dkv-dump`
-- `DKV_BUILD_TESTS` (default `ON`): build `dkv_tests`
-- `DKV_BUILD_BENCHMARKS` (default `ON`): build benchmarks
-- `DKV_BUILD_EXAMPLES` (default `ON`): build `dkv_example`
-
-## Quickstart
+### Embedded API
 ```cpp
-#include "dkv/db.h"
+#include <dkv/db.h>
 
-dkv::Options opts;
-opts.data_dir = "my-data";
-std::unique_ptr<dkv::DB> db;
-dkv::DB::Open(opts, db);
-db->Put({}, "hello", "world");
-std::string val;
-db->Get({}, "hello", val);
+int main() {
+  dkv::Options opts;
+  opts.data_dir = "my-data";
 
-dkv::WriteBatch batch;
-batch.Put("a", "1");
-batch.Put("b", "2");
-batch.Delete("a");
-db->Write({}, batch);  // single WAL sync for the entire batch
+  std::unique_ptr<dkv::DB> db;
+  dkv::DB::Open(opts, db);
+
+  db->Put({}, "hello", "world");
+  std::string value;
+  db->Get({}, "hello", value);
+}
 ```
 
-See `docs/` for design notes and tuning tips.
+### RESP client (server required)
+```cpp
+#include <dkv/resp_client.h>
 
-## Tuning (key options)
-- `memtable_soft_limit_bytes`: flush trigger
-- `sstable_target_size_bytes`: output file size hint; compaction splits output accordingly
-- `level0_file_limit`, `level_base_bytes`, `level_size_multiplier`: leveled compaction thresholds
-- `sstable_block_size_bytes`, `bloom_bits_per_key`: read-path trade-offs (Bloom and block index)
-- `block_cache_capacity_bytes`: enable LRU caching of SSTable blocks to cut repeated disk reads
+int main() {
+  dkv::RespClient c("127.0.0.1", 6379);
+  c.kv().SetOk("k", "v");
+  auto v = c.kv().GetString("k");
+}
+```
 
-See docs/ARCHITECTURE.md for a detailed walkthrough of the design, data structures, and how memtables/SSTables differ from LevelDB. See docs/OPTIONS.md for a full option matrix and their performance trade-offs.
+### Server
+```bash
+./build/dkv-server --data-dir ./dkv-data
+```
 
-## Benchmarks
-see docs/BENCHMARKS.md
+## Build Options
+- `DKV_BUILD_SERVER` (default ON): build `dkv-server`
+- `DKV_BUILD_UTILS` (default ON): build `dkv-dump`
+- `DKV_BUILD_TESTS` (default ON): build `dkv_tests` and `dkv-server-load-test`
+- `DKV_BUILD_BENCHMARKS` (default ON): build benchmarks
+- `DKV_BUILD_EXAMPLES` (default ON): build `dkv_example` and `dkv-resp-client-ops`
 
-## Optional compression backend
-see docs/COMPRESSION.md
+## Docs
+- `docs/ARCHITECTURE.md`
+- `docs/OPTIONS.md`
+- `docs/COMPRESSION.md`
+- `docs/BENCHMARKS.md`
 
 ## License
-MIT License (see LICENSE)
+MIT (see LICENSE)
